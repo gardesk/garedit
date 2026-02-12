@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use garedit_core::{Document, EditCommand, Position};
+use garedit_core::{Document, EditCommand, Position, Selection};
 use gartk_core::{InputEvent, Key, KeyEvent, MouseButton, Rect, Theme};
 use gartk_render::{Renderer, Surface, TextStyle};
 use gartk_x11::{Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
@@ -151,14 +151,9 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
-        if key_event.modifiers.ctrl {
-            match key_event.key {
-                Key::Char('q') | Key::Char('Q') => {
-                    self.should_quit = true;
-                    return;
-                }
-                _ => {}
-            }
+        if self.handle_ctrl_shortcuts(&key_event) || self.handle_alt_shortcuts(&key_event) {
+            self.ensure_cursor_visible();
+            return;
         }
 
         match key_event.key {
@@ -174,15 +169,11 @@ impl App {
             Key::End => self.document.apply(EditCommand::MoveLineEnd),
             Key::PageUp => {
                 let step = self.visible_line_capacity().saturating_sub(1).max(1);
-                for _ in 0..step {
-                    self.document.apply(EditCommand::MoveUp);
-                }
+                self.document.apply(EditCommand::MovePageUp(step));
             }
             Key::PageDown => {
                 let step = self.visible_line_capacity().saturating_sub(1).max(1);
-                for _ in 0..step {
-                    self.document.apply(EditCommand::MoveDown);
-                }
+                self.document.apply(EditCommand::MovePageDown(step));
             }
             Key::Tab => self
                 .document
@@ -200,6 +191,109 @@ impl App {
         }
 
         self.ensure_cursor_visible();
+    }
+
+    fn handle_ctrl_shortcuts(&mut self, key_event: &KeyEvent) -> bool {
+        if !key_event.modifiers.ctrl || key_event.modifiers.alt || key_event.modifiers.super_key {
+            return false;
+        }
+
+        match key_event.key {
+            Key::Left => self.document.apply(EditCommand::MoveWordLeft),
+            Key::Right => self.document.apply(EditCommand::MoveWordRight),
+            Key::Backspace => self.document.apply(EditCommand::DeleteWordBackward),
+            Key::Delete => self.document.apply(EditCommand::DeleteWordForward),
+            Key::Char(c) => {
+                let lower = c.to_ascii_lowercase();
+                match lower {
+                    'q' => self.should_quit = true,
+                    'a' => self.document.apply(EditCommand::MoveLineStart),
+                    'e' => self.document.apply(EditCommand::MoveLineEnd),
+                    'b' => self.document.apply(EditCommand::MoveLeft),
+                    'f' => self.document.apply(EditCommand::MoveRight),
+                    'p' => self.document.apply(EditCommand::MoveUp),
+                    'n' => self.document.apply(EditCommand::MoveDown),
+                    'h' => self.document.apply(EditCommand::Backspace),
+                    'd' => self.document.apply(EditCommand::Delete),
+                    'w' => self.document.apply(EditCommand::DeleteWordBackward),
+                    'u' => self.delete_to_line_start(),
+                    'k' => self.delete_to_line_end(),
+                    'z' => {
+                        if key_event.modifiers.shift {
+                            self.document.apply(EditCommand::Redo);
+                        } else {
+                            self.document.apply(EditCommand::Undo);
+                        }
+                    }
+                    'y' => self.document.apply(EditCommand::Redo),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+
+        true
+    }
+
+    fn handle_alt_shortcuts(&mut self, key_event: &KeyEvent) -> bool {
+        if !key_event.modifiers.alt || key_event.modifiers.ctrl || key_event.modifiers.super_key {
+            return false;
+        }
+
+        match key_event.key {
+            Key::Left => self.document.apply(EditCommand::MoveWordLeft),
+            Key::Right => self.document.apply(EditCommand::MoveWordRight),
+            Key::Backspace => self.document.apply(EditCommand::DeleteWordBackward),
+            Key::Delete => self.document.apply(EditCommand::DeleteWordForward),
+            Key::Char(c) => {
+                let lower = c.to_ascii_lowercase();
+                match lower {
+                    'b' => self.document.apply(EditCommand::MoveWordLeft),
+                    'f' => self.document.apply(EditCommand::MoveWordRight),
+                    'd' => self.document.apply(EditCommand::DeleteWordForward),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+
+        true
+    }
+
+    fn delete_to_line_start(&mut self) {
+        let cursor = self.document.cursor();
+        if cursor.column > 0 {
+            self.document.set_selection(Some(Selection::new(
+                Position::new(cursor.line, 0),
+                cursor,
+            )));
+            self.document.apply(EditCommand::Delete);
+            return;
+        }
+
+        if cursor.line > 0 {
+            self.document.apply(EditCommand::Backspace);
+        }
+    }
+
+    fn delete_to_line_end(&mut self) {
+        let cursor = self.document.cursor();
+        let line_len = self
+            .document
+            .line(cursor.line)
+            .map(|line| line.chars().count())
+            .unwrap_or(cursor.column);
+
+        if cursor.column < line_len {
+            self.document.set_selection(Some(Selection::new(
+                cursor,
+                Position::new(cursor.line, line_len),
+            )));
+            self.document.apply(EditCommand::Delete);
+            return;
+        }
+
+        self.document.apply(EditCommand::Delete);
     }
 
     fn ensure_cursor_visible(&mut self) {
