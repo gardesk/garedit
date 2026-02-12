@@ -1179,7 +1179,7 @@ impl App {
             return Ok(());
         }
 
-        if event.property == AtomEnum::NONE.into() {
+        if event.property == u32::from(AtomEnum::NONE) {
             if !self.paste_from_local_clipboard() {
                 self.status_message = Some("clipboard is empty".to_string());
             }
