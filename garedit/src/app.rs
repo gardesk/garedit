@@ -8,10 +8,12 @@ use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
 const GUTTER_WIDTH: i32 = 64;
 const STATUS_BAR_HEIGHT: i32 = 28;
+const MAX_RECENT_FILES: usize = 20;
 
 #[derive(Debug, Clone, Copy)]
 enum PendingAction {
     OpenPathPrompt,
+    OpenRecentPrompt,
     Quit,
 }
 
@@ -19,6 +21,9 @@ enum PendingAction {
 enum PromptKind {
     OpenPath,
     SaveAsPath,
+    FindQuery,
+    GoToLine,
+    OpenRecent,
     ConfirmDiscard { next: PendingAction },
 }
 
@@ -45,10 +50,52 @@ impl PromptState {
         }
     }
 
+    fn find_query(seed: Option<&str>) -> Self {
+        Self {
+            kind: PromptKind::FindQuery,
+            input: seed.unwrap_or_default().to_string(),
+        }
+    }
+
+    fn go_to_line(seed_line: usize) -> Self {
+        Self {
+            kind: PromptKind::GoToLine,
+            input: seed_line.to_string(),
+        }
+    }
+
+    fn open_recent() -> Self {
+        Self {
+            kind: PromptKind::OpenRecent,
+            input: String::new(),
+        }
+    }
+
     fn confirm_discard(next: PendingAction) -> Self {
         Self {
             kind: PromptKind::ConfirmDiscard { next },
             input: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchMatch {
+    start: Position,
+    end: Position,
+}
+
+#[derive(Debug, Clone)]
+struct SearchState {
+    query: String,
+    last_match: Option<SearchMatch>,
+}
+
+impl SearchState {
+    fn new(query: String) -> Self {
+        Self {
+            query,
+            last_match: None,
         }
     }
 }
@@ -75,6 +122,8 @@ pub struct App {
     show_line_numbers: bool,
     viewport_top_line: usize,
     pointer_drag_anchor: Option<Position>,
+    recent_files: Vec<PathBuf>,
+    search: Option<SearchState>,
     prompt: Option<PromptState>,
     should_quit: bool,
 }
@@ -139,9 +188,14 @@ impl App {
             show_line_numbers: config.show_line_numbers,
             viewport_top_line: 0,
             pointer_drag_anchor: None,
+            recent_files: Vec::new(),
+            search: None,
             prompt: None,
             should_quit: false,
         };
+        if let Some(path) = app.document.path().map(Path::to_path_buf) {
+            app.remember_recent(&path);
+        }
         app.clamp_viewport();
         Ok(app)
     }
@@ -258,6 +312,7 @@ impl App {
                 let step = self.visible_line_capacity().saturating_sub(1).max(1);
                 self.move_cursor(EditCommand::MovePageDown(step), key_event.modifiers.shift);
             }
+            Key::F3 => self.find_with_shortcut(key_event.modifiers.shift),
             Key::Tab => self
                 .document
                 .apply(EditCommand::InsertText(" ".repeat(self.tab_width))),
@@ -291,6 +346,7 @@ impl App {
                 match lower {
                     'q' => self.request_quit(),
                     'o' => self.begin_open_file_flow(),
+                    'r' => self.begin_open_recent_flow(),
                     's' => {
                         if key_event.modifiers.shift {
                             self.begin_save_as_prompt();
@@ -298,6 +354,7 @@ impl App {
                             self.save_current_document();
                         }
                     }
+                    'g' => self.prompt = Some(PromptState::go_to_line(self.document.cursor().line + 1)),
                     'a' => {
                         if key_event.modifiers.shift {
                             self.move_cursor(EditCommand::MoveLineStart, false);
@@ -307,7 +364,7 @@ impl App {
                     }
                     'e' => self.move_cursor(EditCommand::MoveLineEnd, key_event.modifiers.shift),
                     'b' => self.move_cursor(EditCommand::MoveLeft, key_event.modifiers.shift),
-                    'f' => self.move_cursor(EditCommand::MoveRight, key_event.modifiers.shift),
+                    'f' => self.find_with_shortcut(key_event.modifiers.shift),
                     'p' => self.move_cursor(EditCommand::MoveUp, key_event.modifiers.shift),
                     'n' => self.move_cursor(EditCommand::MoveDown, key_event.modifiers.shift),
                     'h' => self.document.apply(EditCommand::Backspace),
@@ -375,6 +432,9 @@ impl App {
                         PendingAction::OpenPathPrompt => {
                             self.prompt = Some(PromptState::open_path())
                         }
+                        PendingAction::OpenRecentPrompt => {
+                            self.prompt = Some(PromptState::open_recent())
+                        }
                         PendingAction::Quit => self.should_quit = true,
                     }
                 }
@@ -421,15 +481,33 @@ impl App {
         };
         self.prompt = None;
 
-        if raw_input.is_empty() {
-            self.status_message = Some("path is empty".to_string());
-            return;
-        }
-
-        let path = resolve_user_path(&raw_input);
         match kind {
-            PromptKind::OpenPath => self.open_path(path),
-            PromptKind::SaveAsPath => self.save_as_path(path),
+            PromptKind::OpenPath => {
+                if raw_input.is_empty() {
+                    self.status_message = Some("path is empty".to_string());
+                    return;
+                }
+                let path = resolve_user_path(&raw_input);
+                self.open_path(path);
+            }
+            PromptKind::SaveAsPath => {
+                if raw_input.is_empty() {
+                    self.status_message = Some("path is empty".to_string());
+                    return;
+                }
+                let path = resolve_user_path(&raw_input);
+                self.save_as_path(path);
+            }
+            PromptKind::FindQuery => {
+                if raw_input.is_empty() {
+                    self.status_message = Some("search query is empty".to_string());
+                    return;
+                }
+                self.search = Some(SearchState::new(raw_input));
+                let _ = self.find_next_match(false);
+            }
+            PromptKind::GoToLine => self.go_to_line_prompt_submit(&raw_input),
+            PromptKind::OpenRecent => self.open_recent_prompt_submit(&raw_input),
             PromptKind::ConfirmDiscard { .. } => {}
         }
     }
@@ -442,8 +520,28 @@ impl App {
         self.prompt = Some(PromptState::open_path());
     }
 
+    fn begin_open_recent_flow(&mut self) {
+        if self.document.is_dirty() {
+            self.prompt = Some(PromptState::confirm_discard(PendingAction::OpenRecentPrompt));
+            return;
+        }
+        self.prompt = Some(PromptState::open_recent());
+    }
+
     fn begin_save_as_prompt(&mut self) {
         self.prompt = Some(PromptState::save_as_path(self.document.path()));
+    }
+
+    fn find_with_shortcut(&mut self, reverse: bool) {
+        if self.search.is_none() {
+            self.prompt = Some(PromptState::find_query(None));
+            return;
+        }
+
+        if !self.find_next_match(reverse) {
+            let seed = self.search.as_ref().map(|s| s.query.as_str());
+            self.prompt = Some(PromptState::find_query(seed));
+        }
     }
 
     fn request_quit(&mut self) {
@@ -461,6 +559,10 @@ impl App {
                 self.document = document;
                 self.viewport_top_line = 0;
                 self.pointer_drag_anchor = None;
+                self.search = None;
+                if let Some(opened) = self.document.path().map(Path::to_path_buf) {
+                    self.remember_recent(&opened);
+                }
                 self.status_message = Some(if existed {
                     format!("opened {}", path.display())
                 } else {
@@ -478,7 +580,9 @@ impl App {
             match self.document.save() {
                 Ok(()) => {
                     if let Some(path) = self.document.path() {
-                        self.status_message = Some(format!("saved {}", path.display()));
+                        let path_buf = path.to_path_buf();
+                        self.remember_recent(&path_buf);
+                        self.status_message = Some(format!("saved {}", path_buf.display()));
                     } else {
                         self.status_message = Some("saved".to_string());
                     }
@@ -495,9 +599,215 @@ impl App {
 
     fn save_as_path(&mut self, path: PathBuf) {
         match self.document.save_as(&path) {
-            Ok(()) => self.status_message = Some(format!("saved {}", path.display())),
+            Ok(()) => {
+                self.remember_recent(&path);
+                self.status_message = Some(format!("saved {}", path.display()));
+            }
             Err(err) => self.status_message = Some(format!("save failed: {err}")),
         }
+    }
+
+    fn remember_recent(&mut self, path: &Path) {
+        let path = path.to_path_buf();
+        self.recent_files.retain(|existing| existing != &path);
+        self.recent_files.insert(0, path);
+        if self.recent_files.len() > MAX_RECENT_FILES {
+            self.recent_files.truncate(MAX_RECENT_FILES);
+        }
+    }
+
+    fn open_recent_prompt_submit(&mut self, raw_input: &str) {
+        if self.recent_files.is_empty() {
+            self.status_message = Some("no recent files".to_string());
+            return;
+        }
+
+        if raw_input.is_empty() {
+            let path = self.recent_files[0].clone();
+            self.open_path(path);
+            return;
+        }
+
+        if let Ok(index) = raw_input.parse::<usize>() {
+            if index == 0 || index > self.recent_files.len() {
+                self.status_message = Some(format!("recent index out of range: {index}"));
+                return;
+            }
+            let path = self.recent_files[index - 1].clone();
+            self.open_path(path);
+            return;
+        }
+
+        let query = raw_input.to_ascii_lowercase();
+        if let Some(path) = self
+            .recent_files
+            .iter()
+            .find(|path| path.to_string_lossy().to_ascii_lowercase().contains(&query))
+            .cloned()
+        {
+            self.open_path(path);
+        } else {
+            self.status_message = Some(format!("no recent file matching '{raw_input}'"));
+        }
+    }
+
+    fn go_to_line_prompt_submit(&mut self, raw_input: &str) {
+        if raw_input.is_empty() {
+            self.status_message = Some("line is empty".to_string());
+            return;
+        }
+
+        let mut parts = raw_input.splitn(2, ':');
+        let line_part = parts.next().unwrap_or_default().trim();
+        let col_part = parts.next().map(str::trim);
+
+        let line_num = match line_part.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                self.status_message = Some(format!("invalid line: {line_part}"));
+                return;
+            }
+        };
+
+        let col_num = match col_part {
+            Some("") | None => 1usize,
+            Some(raw_col) => match raw_col.parse::<usize>() {
+                Ok(value) if value > 0 => value,
+                _ => {
+                    self.status_message = Some(format!("invalid column: {raw_col}"));
+                    return;
+                }
+            },
+        };
+
+        let line_idx = line_num.saturating_sub(1).min(self.document.line_count() - 1);
+        let max_col = self
+            .document
+            .line(line_idx)
+            .map(|line| line.chars().count())
+            .unwrap_or(0);
+        let col_idx = col_num.saturating_sub(1).min(max_col);
+
+        self.document.clear_selection();
+        self.document.set_cursor(Position::new(line_idx, col_idx));
+        self.ensure_cursor_visible();
+        self.status_message = Some(format!("jumped to {}:{}", line_idx + 1, col_idx + 1));
+    }
+
+    fn find_next_match(&mut self, reverse: bool) -> bool {
+        let Some(search) = self.search.as_ref() else {
+            return false;
+        };
+        if search.query.is_empty() {
+            return false;
+        }
+
+        let query = search.query.clone();
+        let from = if reverse {
+            self.search
+                .as_ref()
+                .and_then(|state| state.last_match.map(|m| m.start))
+                .unwrap_or_else(|| self.document.cursor())
+        } else {
+            self.search
+                .as_ref()
+                .and_then(|state| state.last_match.map(|m| m.end))
+                .unwrap_or_else(|| self.document.cursor())
+        };
+
+        let next = if reverse {
+            self.find_match_reverse(&query, from)
+                .or_else(|| self.find_match_reverse(&query, self.document_end_position()))
+        } else {
+            self.find_match_forward(&query, from)
+                .or_else(|| self.find_match_forward(&query, Position::origin()))
+        };
+
+        let Some(found) = next else {
+            self.status_message = Some(format!("no match for '{}'", query));
+            return false;
+        };
+
+        self.document.set_cursor(found.end);
+        self.document
+            .set_selection(Some(Selection::new(found.start, found.end)));
+        self.ensure_cursor_visible();
+        self.status_message = Some(format!(
+            "match {}:{} for '{}'",
+            found.start.line + 1,
+            found.start.column + 1,
+            query
+        ));
+
+        if let Some(search) = self.search.as_mut() {
+            search.last_match = Some(found);
+        }
+        true
+    }
+
+    fn document_end_position(&self) -> Position {
+        let line = self.document.line_count().saturating_sub(1);
+        let column = self
+            .document
+            .line(line)
+            .map(|text| text.chars().count())
+            .unwrap_or(0);
+        Position::new(line, column)
+    }
+
+    fn find_match_forward(&self, query: &str, from: Position) -> Option<SearchMatch> {
+        if query.is_empty() {
+            return None;
+        }
+        let query_chars = query.chars().count();
+
+        for line_idx in from.line..self.document.line_count() {
+            let line = self.document.line(line_idx).unwrap_or("");
+            let start_col = if line_idx == from.line { from.column } else { 0 };
+            let start_byte = column_to_byte_idx(line, start_col);
+            if start_byte >= line.len() {
+                continue;
+            }
+
+            let hay = &line[start_byte..];
+            if let Some(rel_idx) = hay.find(query) {
+                let start_byte_match = start_byte + rel_idx;
+                let start_col_match = byte_to_column_idx(line, start_byte_match);
+                let end_col_match = start_col_match + query_chars;
+                return Some(SearchMatch {
+                    start: Position::new(line_idx, start_col_match),
+                    end: Position::new(line_idx, end_col_match),
+                });
+            }
+        }
+        None
+    }
+
+    fn find_match_reverse(&self, query: &str, from: Position) -> Option<SearchMatch> {
+        if query.is_empty() {
+            return None;
+        }
+        let query_chars = query.chars().count();
+
+        for line_idx in (0..=from.line).rev() {
+            let line = self.document.line(line_idx).unwrap_or("");
+            let end_col = if line_idx == from.line {
+                from.column
+            } else {
+                line.chars().count()
+            };
+            let end_byte = column_to_byte_idx(line, end_col);
+            let hay = &line[..end_byte.min(line.len())];
+            if let Some(start_byte_match) = hay.rfind(query) {
+                let start_col_match = byte_to_column_idx(line, start_byte_match);
+                let end_col_match = start_col_match + query_chars;
+                return Some(SearchMatch {
+                    start: Position::new(line_idx, start_col_match),
+                    end: Position::new(line_idx, end_col_match),
+                });
+            }
+        }
+        None
     }
 
     fn select_all(&mut self) {
@@ -981,9 +1291,29 @@ impl App {
         match prompt.kind {
             PromptKind::OpenPath => format!("open path: {}_", prompt.input),
             PromptKind::SaveAsPath => format!("save as: {}_", prompt.input),
+            PromptKind::FindQuery => format!("find query: {}_", prompt.input),
+            PromptKind::GoToLine => format!("go to line[:col]: {}_", prompt.input),
+            PromptKind::OpenRecent => {
+                let preview = self
+                    .recent_files
+                    .iter()
+                    .take(5)
+                    .enumerate()
+                    .map(|(idx, path)| format!("[{}] {}", idx + 1, path.display()))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                if preview.is_empty() {
+                    format!("open recent (none): {}_", prompt.input)
+                } else {
+                    format!("open recent {}  |  pick #: {}_", preview, prompt.input)
+                }
+            }
             PromptKind::ConfirmDiscard {
                 next: PendingAction::OpenPathPrompt,
             } => "unsaved changes: discard and open file? [y/N]".to_string(),
+            PromptKind::ConfirmDiscard {
+                next: PendingAction::OpenRecentPrompt,
+            } => "unsaved changes: discard and open recent? [y/N]".to_string(),
             PromptKind::ConfirmDiscard {
                 next: PendingAction::Quit,
             } => "unsaved changes: discard and quit? [y/N]".to_string(),
@@ -1044,6 +1374,20 @@ fn slice_to_column(line: &str, column: usize) -> &str {
         Some((idx, _)) => &line[..idx],
         None => line,
     }
+}
+
+fn column_to_byte_idx(line: &str, column: usize) -> usize {
+    if column == 0 {
+        return 0;
+    }
+    line.char_indices()
+        .nth(column)
+        .map(|(idx, _)| idx)
+        .unwrap_or(line.len())
+}
+
+fn byte_to_column_idx(line: &str, byte_idx: usize) -> usize {
+    line[..byte_idx.min(line.len())].chars().count()
 }
 
 fn open_or_create_document(path: &Path) -> Result<Document> {
