@@ -1,16 +1,24 @@
 use anyhow::Result;
 use garedit_core::{Document, EditCommand, Position, Selection};
-use gartk_core::{InputEvent, Key, KeyEvent, MouseButton, Rect, Theme};
+use gartk_core::{
+    InputEvent, Key, KeyEvent, MouseButton, Rect, SelectionNotifyEvent, SelectionRequestEvent,
+    Theme,
+};
 use gartk_render::{Renderer, Surface, TextStyle};
-use gartk_x11::{Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
+use gartk_x11::{Atoms, Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
 use std::path::{Path, PathBuf};
-use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
+use x11rb::protocol::xproto::{
+    Atom, AtomEnum, ConnectionExt, EventMask, ImageFormat, PropMode,
+    SelectionNotifyEvent as XSelectionNotifyEvent,
+};
+use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
 const GUTTER_WIDTH: i32 = 64;
 const TAB_BAR_HEIGHT: i32 = 30;
 const TAB_WIDTH: i32 = 220;
 const STATUS_BAR_HEIGHT: i32 = 28;
 const MAX_RECENT_FILES: usize = 20;
+const MAX_PALETTE_PREVIEW: usize = 6;
 
 #[derive(Debug, Clone, Copy)]
 enum PendingAction {
@@ -24,6 +32,7 @@ enum PromptKind {
     FindQuery,
     GoToLine,
     OpenRecent,
+    CommandPalette,
     ConfirmDiscard { next: PendingAction },
 }
 
@@ -77,6 +86,14 @@ impl PromptState {
         }
     }
 
+    fn command_palette() -> Self {
+        Self {
+            kind: PromptKind::CommandPalette,
+            input: String::new(),
+            replace_on_type: false,
+        }
+    }
+
     fn confirm_discard(next: PendingAction) -> Self {
         Self {
             kind: PromptKind::ConfirmDiscard { next },
@@ -105,6 +122,90 @@ impl SearchState {
             last_match: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteCommand {
+    OpenFile,
+    OpenRecent,
+    Save,
+    SaveAs,
+    NewTab,
+    NextTab,
+    PrevTab,
+    Find,
+    FindNext,
+    FindPrev,
+    GoToLine,
+    Copy,
+    Cut,
+    Paste,
+    Quit,
+}
+
+impl PaletteCommand {
+    fn id(self) -> &'static str {
+        match self {
+            Self::OpenFile => "open",
+            Self::OpenRecent => "recent",
+            Self::Save => "save",
+            Self::SaveAs => "save_as",
+            Self::NewTab => "new_tab",
+            Self::NextTab => "next_tab",
+            Self::PrevTab => "prev_tab",
+            Self::Find => "find",
+            Self::FindNext => "find_next",
+            Self::FindPrev => "find_prev",
+            Self::GoToLine => "go_to_line",
+            Self::Copy => "copy",
+            Self::Cut => "cut",
+            Self::Paste => "paste",
+            Self::Quit => "quit",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpenFile => "open file",
+            Self::OpenRecent => "open recent",
+            Self::Save => "save file",
+            Self::SaveAs => "save as",
+            Self::NewTab => "new tab",
+            Self::NextTab => "next tab",
+            Self::PrevTab => "previous tab",
+            Self::Find => "find",
+            Self::FindNext => "find next",
+            Self::FindPrev => "find previous",
+            Self::GoToLine => "go to line",
+            Self::Copy => "copy selection",
+            Self::Cut => "cut selection",
+            Self::Paste => "paste clipboard",
+            Self::Quit => "quit",
+        }
+    }
+}
+
+const PALETTE_COMMANDS: [PaletteCommand; 15] = [
+    PaletteCommand::OpenFile,
+    PaletteCommand::OpenRecent,
+    PaletteCommand::Save,
+    PaletteCommand::SaveAs,
+    PaletteCommand::NewTab,
+    PaletteCommand::NextTab,
+    PaletteCommand::PrevTab,
+    PaletteCommand::Find,
+    PaletteCommand::FindNext,
+    PaletteCommand::FindPrev,
+    PaletteCommand::GoToLine,
+    PaletteCommand::Copy,
+    PaletteCommand::Cut,
+    PaletteCommand::Paste,
+    PaletteCommand::Quit,
+];
+
+#[derive(Debug, Clone, Copy)]
+struct PendingPaste {
+    selection: Atom,
 }
 
 #[derive(Debug, Clone)]
@@ -155,12 +256,19 @@ pub struct App {
     recent_files: Vec<PathBuf>,
     search: Option<SearchState>,
     prompt: Option<PromptState>,
+    clipboard_atoms: Atoms,
+    selection_text: Option<String>,
+    local_clipboard: Option<String>,
+    paste_property: Atom,
+    pending_paste: Option<PendingPaste>,
     should_quit: bool,
 }
 
 impl App {
     pub fn new(config: AppConfig) -> Result<Self> {
         let conn = Connection::connect(None)?;
+        let clipboard_atoms = Atoms::new(&conn)?;
+        let paste_property = conn.intern_atom("GAREDIT_CLIPBOARD", false)?;
         let monitor = gartk_x11::monitor_at_pointer(&conn)?;
 
         let width = config.width.min(monitor.rect.width);
@@ -223,6 +331,11 @@ impl App {
             recent_files: Vec::new(),
             search: None,
             prompt: None,
+            clipboard_atoms,
+            selection_text: None,
+            local_clipboard: None,
+            paste_property,
+            pending_paste: None,
             should_quit: false,
         };
         if let Some(path) = app.document.path().map(Path::to_path_buf) {
@@ -340,6 +453,9 @@ impl App {
                         mouse_event.modifiers.shift,
                     );
                     ev.request_redraw();
+                } else if mouse_event.button == Some(MouseButton::Middle) {
+                    self.request_clipboard_paste(self.clipboard_atoms.primary);
+                    ev.request_redraw();
                 }
             }
             InputEvent::MouseMove(mouse_event) => {
@@ -376,6 +492,22 @@ impl App {
             InputEvent::CloseRequested => {
                 self.request_quit();
                 ev.request_redraw();
+            }
+            InputEvent::SelectionRequest(selection_request) => {
+                if let Err(err) = self.handle_selection_request(&selection_request) {
+                    self.status_message = Some(format!("clipboard request failed: {err}"));
+                }
+            }
+            InputEvent::SelectionNotify(selection_notify) => {
+                if let Err(err) = self.handle_selection_notify(&selection_notify) {
+                    self.status_message = Some(format!("paste failed: {err}"));
+                } else {
+                    self.ensure_cursor_visible();
+                }
+                ev.request_redraw();
+            }
+            InputEvent::SelectionClear => {
+                self.pending_paste = None;
             }
             _ => {}
         }
@@ -480,11 +612,20 @@ impl App {
                     'e' => self.move_cursor(EditCommand::MoveLineEnd, key_event.modifiers.shift),
                     'b' => self.move_cursor(EditCommand::MoveLeft, key_event.modifiers.shift),
                     'f' => self.open_find_prompt(),
-                    'p' => self.move_cursor(EditCommand::MoveUp, key_event.modifiers.shift),
+                    'p' => {
+                        if key_event.modifiers.shift {
+                            self.open_command_palette();
+                        } else {
+                            self.move_cursor(EditCommand::MoveUp, key_event.modifiers.shift);
+                        }
+                    }
                     'n' => self.move_cursor(EditCommand::MoveDown, key_event.modifiers.shift),
                     'h' => self.document.apply(EditCommand::Backspace),
                     'd' => self.document.apply(EditCommand::Delete),
                     'w' => self.document.apply(EditCommand::DeleteWordBackward),
+                    'c' => self.copy_selection_to_clipboard(),
+                    'x' => self.cut_selection_to_clipboard(),
+                    'v' => self.request_clipboard_paste(self.clipboard_atoms.clipboard),
                     'u' => self.delete_to_line_start(),
                     'k' => self.delete_to_line_end(),
                     'z' => {
@@ -639,6 +780,7 @@ impl App {
             }
             PromptKind::GoToLine => self.go_to_line_prompt_submit(&raw_input),
             PromptKind::OpenRecent => self.open_recent_prompt_submit(&raw_input),
+            PromptKind::CommandPalette => self.command_palette_submit(&raw_input),
             PromptKind::ConfirmDiscard { .. } => {}
         }
     }
@@ -653,6 +795,10 @@ impl App {
 
     fn begin_save_as_prompt(&mut self) {
         self.prompt = Some(PromptState::save_as_path(self.document.path()));
+    }
+
+    fn open_command_palette(&mut self) {
+        self.prompt = Some(PromptState::command_palette());
     }
 
     fn open_find_prompt(&mut self) {
@@ -688,6 +834,253 @@ impl App {
                 self.search = Some(SearchState::new(query));
             }
         }
+    }
+
+    fn copy_selection_to_clipboard(&mut self) {
+        let Some(text) = self.selected_text() else {
+            self.status_message = Some("nothing selected".to_string());
+            return;
+        };
+        let copied_chars = text.chars().count();
+        if let Err(err) = self.set_clipboard_text(text) {
+            self.status_message = Some(format!("copy failed: {err}"));
+            return;
+        }
+        self.status_message = Some(format!("copied {copied_chars} chars"));
+    }
+
+    fn cut_selection_to_clipboard(&mut self) {
+        let Some(text) = self.selected_text() else {
+            self.status_message = Some("nothing selected".to_string());
+            return;
+        };
+        let cut_chars = text.chars().count();
+        if let Err(err) = self.set_clipboard_text(text) {
+            self.status_message = Some(format!("cut failed: {err}"));
+            return;
+        }
+        self.document.apply(EditCommand::Delete);
+        self.status_message = Some(format!("cut {cut_chars} chars"));
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.document.selection()?;
+        let (start, end) = selection.normalized();
+        if start == end {
+            return None;
+        }
+
+        if start.line == end.line {
+            let line = self.document.line(start.line).unwrap_or("");
+            let start_byte = column_to_byte_idx(line, start.column);
+            let end_byte = column_to_byte_idx(line, end.column);
+            return Some(line[start_byte..end_byte].to_string());
+        }
+
+        let mut out = String::new();
+        for line_idx in start.line..=end.line {
+            let line = self.document.line(line_idx).unwrap_or("");
+            if line_idx == start.line {
+                let start_byte = column_to_byte_idx(line, start.column);
+                out.push_str(&line[start_byte..]);
+            } else if line_idx == end.line {
+                let end_byte = column_to_byte_idx(line, end.column);
+                out.push_str(&line[..end_byte]);
+            } else {
+                out.push_str(line);
+            }
+            if line_idx < end.line {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
+    fn set_clipboard_text(&mut self, text: String) -> Result<()> {
+        self.local_clipboard = Some(text.clone());
+        self.selection_text = Some(text);
+
+        let conn = self.window.connection();
+        conn.inner().set_selection_owner(
+            self.window.id(),
+            self.clipboard_atoms.clipboard,
+            x11rb::CURRENT_TIME,
+        )?;
+        conn.inner().set_selection_owner(
+            self.window.id(),
+            self.clipboard_atoms.primary,
+            x11rb::CURRENT_TIME,
+        )?;
+        conn.flush()?;
+        Ok(())
+    }
+
+    fn request_clipboard_paste(&mut self, selection: Atom) {
+        if self.pending_paste.is_some() {
+            return;
+        }
+
+        let conn = self.window.connection();
+        let request = conn.inner().convert_selection(
+            self.window.id(),
+            selection,
+            self.clipboard_atoms.utf8_string,
+            self.paste_property,
+            x11rb::CURRENT_TIME,
+        );
+        if let Err(err) = request {
+            if !self.paste_from_local_clipboard() {
+                self.status_message = Some(format!("paste request failed: {err}"));
+            }
+            return;
+        }
+        if let Err(err) = conn.flush() {
+            if !self.paste_from_local_clipboard() {
+                self.status_message = Some(format!("paste request failed: {err}"));
+            }
+            return;
+        }
+        self.pending_paste = Some(PendingPaste { selection });
+    }
+
+    fn paste_from_local_clipboard(&mut self) -> bool {
+        let Some(text) = self.local_clipboard.clone() else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        let pasted_chars = text.chars().count();
+        self.document.apply(EditCommand::InsertText(text));
+        self.status_message = Some(format!("pasted {pasted_chars} chars"));
+        true
+    }
+
+    fn handle_selection_request(&mut self, event: &SelectionRequestEvent) -> Result<()> {
+        if event.selection != self.clipboard_atoms.clipboard
+            && event.selection != self.clipboard_atoms.primary
+        {
+            self.send_selection_notify(event, AtomEnum::NONE.into())?;
+            return Ok(());
+        }
+
+        let Some(text) = self.selection_text.as_ref() else {
+            self.send_selection_notify(event, AtomEnum::NONE.into())?;
+            return Ok(());
+        };
+
+        let property = if event.property == 0 {
+            event.target
+        } else {
+            event.property
+        };
+        let conn = self.window.connection();
+
+        if event.target == self.clipboard_atoms.targets {
+            let targets: [Atom; 6] = [
+                self.clipboard_atoms.targets,
+                self.clipboard_atoms.utf8_string,
+                self.clipboard_atoms.text_plain_utf8,
+                self.clipboard_atoms.text_plain,
+                self.clipboard_atoms.text,
+                self.clipboard_atoms.string,
+            ];
+            conn.inner().change_property32(
+                PropMode::REPLACE,
+                event.requestor,
+                property,
+                AtomEnum::ATOM,
+                &targets,
+            )?;
+            self.send_selection_notify(event, property)?;
+            return Ok(());
+        }
+
+        if event.target == self.clipboard_atoms.utf8_string
+            || event.target == self.clipboard_atoms.text_plain_utf8
+            || event.target == self.clipboard_atoms.text_plain
+            || event.target == self.clipboard_atoms.text
+            || event.target == self.clipboard_atoms.string
+        {
+            let property_type = if event.target == self.clipboard_atoms.string {
+                AtomEnum::STRING.into()
+            } else {
+                self.clipboard_atoms.utf8_string
+            };
+            conn.inner().change_property8(
+                PropMode::REPLACE,
+                event.requestor,
+                property,
+                property_type,
+                text.as_bytes(),
+            )?;
+            self.send_selection_notify(event, property)?;
+            return Ok(());
+        }
+
+        self.send_selection_notify(event, AtomEnum::NONE.into())?;
+        Ok(())
+    }
+
+    fn send_selection_notify(&self, event: &SelectionRequestEvent, property: Atom) -> Result<()> {
+        let notify = XSelectionNotifyEvent {
+            response_type: x11rb::protocol::xproto::SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: event.time,
+            requestor: event.requestor,
+            selection: event.selection,
+            target: event.target,
+            property,
+        };
+        let conn = self.window.connection();
+        conn.inner()
+            .send_event(false, event.requestor, EventMask::NO_EVENT, notify)?;
+        conn.flush()?;
+        Ok(())
+    }
+
+    fn handle_selection_notify(&mut self, event: &SelectionNotifyEvent) -> Result<()> {
+        let Some(pending) = self.pending_paste.take() else {
+            return Ok(());
+        };
+        if pending.selection != event.selection {
+            return Ok(());
+        }
+
+        if event.property == AtomEnum::NONE.into() {
+            if !self.paste_from_local_clipboard() {
+                self.status_message = Some("clipboard is empty".to_string());
+            }
+            return Ok(());
+        }
+
+        let conn = self.window.connection();
+        let reply = conn
+            .inner()
+            .get_property(
+                true,
+                self.window.id(),
+                event.property,
+                AtomEnum::ANY,
+                0,
+                u32::MAX,
+            )?
+            .reply()?;
+        let mut text = String::from_utf8_lossy(&reply.value).into_owned();
+        while text.ends_with('\0') {
+            text.pop();
+        }
+        if text.is_empty() {
+            if !self.paste_from_local_clipboard() {
+                self.status_message = Some("clipboard is empty".to_string());
+            }
+            return Ok(());
+        }
+        let pasted_chars = text.chars().count();
+        self.local_clipboard = Some(text.clone());
+        self.document.apply(EditCommand::InsertText(text));
+        self.status_message = Some(format!("pasted {pasted_chars} chars"));
+        Ok(())
     }
 
     fn request_quit(&mut self) {
@@ -829,6 +1222,72 @@ impl App {
             self.open_path(path);
         } else {
             self.status_message = Some(format!("no recent file matching '{raw_input}'"));
+        }
+    }
+
+    fn matching_palette_commands(&self, raw_query: &str) -> Vec<PaletteCommand> {
+        let query = raw_query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return PALETTE_COMMANDS.to_vec();
+        }
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        PALETTE_COMMANDS
+            .iter()
+            .copied()
+            .filter(|cmd| {
+                let hay = format!("{} {}", cmd.id(), cmd.label()).to_ascii_lowercase();
+                tokens.iter().all(|token| hay.contains(token))
+            })
+            .collect()
+    }
+
+    fn command_palette_submit(&mut self, raw_input: &str) {
+        let query = raw_input.trim();
+        let matches = self.matching_palette_commands(query);
+        if matches.is_empty() {
+            self.status_message = Some(format!("no command matching '{query}'"));
+            return;
+        }
+
+        let chosen = if let Ok(index) = query.parse::<usize>() {
+            if index == 0 || index > matches.len() {
+                self.status_message = Some(format!("command index out of range: {index}"));
+                return;
+            }
+            matches[index - 1]
+        } else if query.is_empty() {
+            matches[0]
+        } else {
+            let lowered = query.to_ascii_lowercase();
+            matches
+                .iter()
+                .copied()
+                .find(|cmd| cmd.id() == lowered || cmd.label() == lowered)
+                .unwrap_or(matches[0])
+        };
+
+        self.execute_palette_command(chosen);
+    }
+
+    fn execute_palette_command(&mut self, command: PaletteCommand) {
+        match command {
+            PaletteCommand::OpenFile => self.begin_open_file_flow(),
+            PaletteCommand::OpenRecent => self.begin_open_recent_flow(),
+            PaletteCommand::Save => self.save_current_document(),
+            PaletteCommand::SaveAs => self.begin_save_as_prompt(),
+            PaletteCommand::NewTab => self.new_tab(),
+            PaletteCommand::NextTab => self.switch_tab(1),
+            PaletteCommand::PrevTab => self.switch_tab(-1),
+            PaletteCommand::Find => self.open_find_prompt(),
+            PaletteCommand::FindNext => self.repeat_find_or_prompt(false),
+            PaletteCommand::FindPrev => self.repeat_find_or_prompt(true),
+            PaletteCommand::GoToLine => {
+                self.prompt = Some(PromptState::go_to_line(self.document.cursor().line + 1))
+            }
+            PaletteCommand::Copy => self.copy_selection_to_clipboard(),
+            PaletteCommand::Cut => self.cut_selection_to_clipboard(),
+            PaletteCommand::Paste => self.request_clipboard_paste(self.clipboard_atoms.clipboard),
+            PaletteCommand::Quit => self.request_quit(),
         }
     }
 
@@ -1571,6 +2030,21 @@ impl App {
                     format!("open recent (none): {}_", prompt.input)
                 } else {
                     format!("open recent {}  |  pick #: {}_", preview, prompt.input)
+                }
+            }
+            PromptKind::CommandPalette => {
+                let commands = self.matching_palette_commands(&prompt.input);
+                if commands.is_empty() {
+                    format!("command: {}_  |  no matches", prompt.input)
+                } else {
+                    let preview = commands
+                        .iter()
+                        .take(MAX_PALETTE_PREVIEW)
+                        .enumerate()
+                        .map(|(idx, cmd)| format!("[{}] {}", idx + 1, cmd.label()))
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    format!("command: {}_  |  {}", prompt.input, preview)
                 }
             }
             PromptKind::ConfirmDiscard {
