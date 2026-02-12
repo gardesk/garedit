@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::io;
+use std::io::{Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -68,4 +73,27 @@ pub fn socket_path() -> PathBuf {
     dirs::runtime_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("garedit.sock")
+}
+
+pub fn send_command(command: &Command) -> io::Result<Response> {
+    let mut stream = UnixStream::connect(socket_path())?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+
+    let payload = serde_json::to_vec(command)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    stream.write_all(&payload)?;
+    stream.shutdown(Shutdown::Write)?;
+
+    let mut response_bytes = Vec::new();
+    stream.read_to_end(&mut response_bytes)?;
+    if response_bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "empty response from garedit",
+        ));
+    }
+
+    serde_json::from_slice(&response_bytes)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
