@@ -114,7 +114,11 @@ impl Document {
         ))
     }
 
-    fn from_normalized_text(text: &str, newline_style: NewlineStyle, path: Option<PathBuf>) -> Self {
+    fn from_normalized_text(
+        text: &str,
+        newline_style: NewlineStyle,
+        path: Option<PathBuf>,
+    ) -> Self {
         let mut lines: Vec<String> = text.split('\n').map(ToString::to_string).collect();
         if lines.is_empty() {
             lines.push(String::new());
@@ -669,9 +673,7 @@ fn next_word_boundary_in_line(line: &str, column: usize) -> usize {
 }
 
 fn first_non_whitespace_column(line: &str) -> usize {
-    line.chars()
-        .position(|ch| !ch.is_whitespace())
-        .unwrap_or(0)
+    line.chars().position(|ch| !ch.is_whitespace()).unwrap_or(0)
 }
 
 fn column_to_byte_idx(line: &str, column: usize) -> usize {

@@ -372,7 +372,9 @@ impl App {
                 Key::Return | Key::Char('y') | Key::Char('Y') => {
                     self.prompt = None;
                     match next {
-                        PendingAction::OpenPathPrompt => self.prompt = Some(PromptState::open_path()),
+                        PendingAction::OpenPathPrompt => {
+                            self.prompt = Some(PromptState::open_path())
+                        }
                         PendingAction::Quit => self.should_quit = true,
                     }
                 }
@@ -512,7 +514,8 @@ impl App {
         if start == end {
             self.document.clear_selection();
         } else {
-            self.document.set_selection(Some(Selection::new(start, end)));
+            self.document
+                .set_selection(Some(Selection::new(start, end)));
         }
     }
 
@@ -566,10 +569,8 @@ impl App {
     fn delete_to_line_start(&mut self) {
         let cursor = self.document.cursor();
         if cursor.column > 0 {
-            self.document.set_selection(Some(Selection::new(
-                Position::new(cursor.line, 0),
-                cursor,
-            )));
+            self.document
+                .set_selection(Some(Selection::new(Position::new(cursor.line, 0), cursor)));
             self.document.apply(EditCommand::Delete);
             return;
         }
