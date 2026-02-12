@@ -1,0 +1,17 @@
+[package]
+name = "garedit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+garedit-core.workspace = true
+gartk-core.workspace = true
+gartk-render.workspace = true
+gartk-x11.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+x11rb.workspace = true

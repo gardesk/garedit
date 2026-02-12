@@ -1,0 +1,12 @@
+[package]
+name = "gareditctl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+garedit-ipc.workspace = true
+serde_json.workspace = true

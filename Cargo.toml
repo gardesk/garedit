@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["garedit", "garedit-core", "garedit-ipc", "gareditctl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["mfwolffe"]
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+garedit-core = { path = "garedit-core" }
+garedit-ipc = { path = "garedit-ipc" }
+
+# gartk toolkit
+gartk-core = { path = "../gartk/gartk-core" }
+gartk-render = { path = "../gartk/gartk-render" }
+gartk-x11 = { path = "../gartk/gartk-x11" }
+
+# Foundation
+anyhow = "1.0"
+thiserror = "2.0"
+clap = { version = "4.5", features = ["derive"] }
+
+# Serialization and config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "6.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# X11
+# Keep default-safe API surface; avoid forcing direct libxcb linkage.
+x11rb = "0.13"
