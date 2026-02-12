@@ -108,7 +108,11 @@ struct OpenTab {
 }
 
 impl OpenTab {
-    fn from_active(document: Document, viewport_top_line: usize, search: Option<SearchState>) -> Self {
+    fn from_active(
+        document: Document,
+        viewport_top_line: usize,
+        search: Option<SearchState>,
+    ) -> Self {
         Self {
             document,
             viewport_top_line,
@@ -293,10 +297,16 @@ impl App {
 
     fn tab_title(&self, index: usize) -> String {
         let (path, dirty) = if index == self.active_tab {
-            (self.document.path().map(Path::to_path_buf), self.document.is_dirty())
+            (
+                self.document.path().map(Path::to_path_buf),
+                self.document.is_dirty(),
+            )
         } else {
             let tab = &self.tabs[index];
-            (tab.document.path().map(Path::to_path_buf), tab.document.is_dirty())
+            (
+                tab.document.path().map(Path::to_path_buf),
+                tab.document.is_dirty(),
+            )
         };
 
         let mut title = path
@@ -450,7 +460,9 @@ impl App {
                             self.save_current_document();
                         }
                     }
-                    'g' => self.prompt = Some(PromptState::go_to_line(self.document.cursor().line + 1)),
+                    'g' => {
+                        self.prompt = Some(PromptState::go_to_line(self.document.cursor().line + 1))
+                    }
                     'a' => {
                         if key_event.modifiers.shift {
                             self.move_cursor(EditCommand::MoveLineStart, false);
@@ -797,7 +809,9 @@ impl App {
             },
         };
 
-        let line_idx = line_num.saturating_sub(1).min(self.document.line_count() - 1);
+        let line_idx = line_num
+            .saturating_sub(1)
+            .min(self.document.line_count() - 1);
         let max_col = self
             .document
             .line(line_idx)
@@ -880,7 +894,11 @@ impl App {
 
         for line_idx in from.line..self.document.line_count() {
             let line = self.document.line(line_idx).unwrap_or("");
-            let start_col = if line_idx == from.line { from.column } else { 0 };
+            let start_col = if line_idx == from.line {
+                from.column
+            } else {
+                0
+            };
             let start_byte = column_to_byte_idx(line, start_col);
             if start_byte >= line.len() {
                 continue;
@@ -1277,7 +1295,8 @@ impl App {
             } else {
                 self.theme.item_background
             };
-            self.renderer.fill_rect(Rect::new(x, 0, width, tab_height), bg)?;
+            self.renderer
+                .fill_rect(Rect::new(x, 0, width, tab_height), bg)?;
             self.renderer.line(
                 x as f64,
                 0.0,
@@ -1288,8 +1307,7 @@ impl App {
             )?;
 
             let title = self.tab_title(idx);
-            self.renderer
-                .text(&title, (x + 8) as f64, 7.0, &style)?;
+            self.renderer.text(&title, (x + 8) as f64, 7.0, &style)?;
 
             x += TAB_WIDTH;
         }
