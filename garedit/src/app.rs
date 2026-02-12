@@ -989,26 +989,30 @@ impl App {
             return;
         }
 
-        let conn = self.window.connection();
-        let request = conn.inner().convert_selection(
-            self.window.id(),
-            selection,
-            self.clipboard_atoms.utf8_string,
-            self.paste_property,
-            x11rb::CURRENT_TIME,
-        );
-        if let Err(err) = request {
+        let paste_error = {
+            let conn = self.window.connection();
+            if let Err(err) = conn.inner().convert_selection(
+                self.window.id(),
+                selection,
+                self.clipboard_atoms.utf8_string,
+                self.paste_property,
+                x11rb::CURRENT_TIME,
+            ) {
+                Some(err.to_string())
+            } else if let Err(err) = conn.flush() {
+                Some(err.to_string())
+            } else {
+                None
+            }
+        };
+
+        if let Some(err) = paste_error {
             if !self.paste_from_local_clipboard() {
                 self.status_message = Some(format!("paste request failed: {err}"));
             }
             return;
         }
-        if let Err(err) = conn.flush() {
-            if !self.paste_from_local_clipboard() {
-                self.status_message = Some(format!("paste request failed: {err}"));
-            }
-            return;
-        }
+
         self.pending_paste = Some(PendingPaste { selection });
     }
 
