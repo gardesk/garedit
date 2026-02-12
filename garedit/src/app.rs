@@ -31,6 +31,7 @@ enum PromptKind {
 struct PromptState {
     kind: PromptKind,
     input: String,
+    replace_on_type: bool,
 }
 
 impl PromptState {
@@ -38,6 +39,7 @@ impl PromptState {
         Self {
             kind: PromptKind::OpenPath,
             input: String::new(),
+            replace_on_type: false,
         }
     }
 
@@ -47,13 +49,15 @@ impl PromptState {
             input: seed
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            replace_on_type: false,
         }
     }
 
-    fn find_query(seed: Option<&str>) -> Self {
+    fn find_query(seed: Option<&str>, replace_on_type: bool) -> Self {
         Self {
             kind: PromptKind::FindQuery,
             input: seed.unwrap_or_default().to_string(),
+            replace_on_type,
         }
     }
 
@@ -61,6 +65,7 @@ impl PromptState {
         Self {
             kind: PromptKind::GoToLine,
             input: seed_line.to_string(),
+            replace_on_type: false,
         }
     }
 
@@ -68,6 +73,7 @@ impl PromptState {
         Self {
             kind: PromptKind::OpenRecent,
             input: String::new(),
+            replace_on_type: false,
         }
     }
 
@@ -75,6 +81,7 @@ impl PromptState {
         Self {
             kind: PromptKind::ConfirmDiscard { next },
             input: String::new(),
+            replace_on_type: false,
         }
     }
 }
@@ -410,7 +417,7 @@ impl App {
                 let step = self.visible_line_capacity().saturating_sub(1).max(1);
                 self.move_cursor(EditCommand::MovePageDown(step), key_event.modifiers.shift);
             }
-            Key::F3 => self.find_with_shortcut(key_event.modifiers.shift),
+            Key::F3 => self.repeat_find_or_prompt(key_event.modifiers.shift),
             Key::Tab => self
                 .document
                 .apply(EditCommand::InsertText(" ".repeat(self.tab_width))),
@@ -472,7 +479,7 @@ impl App {
                     }
                     'e' => self.move_cursor(EditCommand::MoveLineEnd, key_event.modifiers.shift),
                     'b' => self.move_cursor(EditCommand::MoveLeft, key_event.modifiers.shift),
-                    'f' => self.find_with_shortcut(key_event.modifiers.shift),
+                    'f' => self.open_find_prompt(),
                     'p' => self.move_cursor(EditCommand::MoveUp, key_event.modifiers.shift),
                     'n' => self.move_cursor(EditCommand::MoveDown, key_event.modifiers.shift),
                     'h' => self.document.apply(EditCommand::Backspace),
@@ -545,26 +552,46 @@ impl App {
             return;
         }
 
-        let mut submit: Option<(PromptKind, String)> = None;
+        let mut submit: Option<(PromptKind, String, bool)> = None;
         let mut cancel = false;
 
         if let Some(prompt) = self.prompt.as_mut() {
             match key_event.key {
                 Key::Escape => cancel = true,
                 Key::Return => {
-                    submit = Some((prompt.kind, prompt.input.trim().to_string()));
+                    submit = Some((
+                        prompt.kind,
+                        prompt.input.trim().to_string(),
+                        matches!(prompt.kind, PromptKind::FindQuery) && key_event.modifiers.shift,
+                    ));
                 }
                 Key::Backspace => {
-                    prompt.input.pop();
+                    if prompt.replace_on_type {
+                        prompt.input.clear();
+                        prompt.replace_on_type = false;
+                    } else {
+                        prompt.input.pop();
+                    }
                 }
-                Key::Space => prompt.input.push(' '),
+                Key::Space => {
+                    if prompt.replace_on_type {
+                        prompt.input.clear();
+                        prompt.replace_on_type = false;
+                    }
+                    prompt.input.push(' ');
+                }
                 Key::Char(c) => {
                     if key_event.modifiers.ctrl {
                         let lower = c.to_ascii_lowercase();
                         if lower == 'u' {
                             prompt.input.clear();
+                            prompt.replace_on_type = false;
                         }
                     } else if !(key_event.modifiers.alt || key_event.modifiers.super_key) {
+                        if prompt.replace_on_type {
+                            prompt.input.clear();
+                            prompt.replace_on_type = false;
+                        }
                         prompt.input.push(c);
                     }
                 }
@@ -578,10 +605,12 @@ impl App {
             return;
         }
 
-        let Some((kind, raw_input)) = submit else {
+        let Some((kind, raw_input, reverse)) = submit else {
             return;
         };
-        self.prompt = None;
+        if !matches!(kind, PromptKind::FindQuery) {
+            self.prompt = None;
+        }
 
         match kind {
             PromptKind::OpenPath => {
@@ -605,8 +634,8 @@ impl App {
                     self.status_message = Some("search query is empty".to_string());
                     return;
                 }
-                self.search = Some(SearchState::new(raw_input));
-                let _ = self.find_next_match(false);
+                self.set_search_query(raw_input);
+                let _ = self.find_next_match(reverse);
             }
             PromptKind::GoToLine => self.go_to_line_prompt_submit(&raw_input),
             PromptKind::OpenRecent => self.open_recent_prompt_submit(&raw_input),
@@ -626,15 +655,38 @@ impl App {
         self.prompt = Some(PromptState::save_as_path(self.document.path()));
     }
 
-    fn find_with_shortcut(&mut self, reverse: bool) {
-        if self.search.is_none() {
-            self.prompt = Some(PromptState::find_query(None));
-            return;
-        }
+    fn open_find_prompt(&mut self) {
+        let seed = self
+            .search
+            .as_ref()
+            .map(|state| state.query.trim())
+            .filter(|query| !query.is_empty());
+        self.prompt = Some(PromptState::find_query(seed, seed.is_some()));
+    }
 
-        if !self.find_next_match(reverse) {
-            let seed = self.search.as_ref().map(|s| s.query.as_str());
-            self.prompt = Some(PromptState::find_query(seed));
+    fn repeat_find_or_prompt(&mut self, reverse: bool) {
+        let has_query = self
+            .search
+            .as_ref()
+            .map(|state| !state.query.trim().is_empty())
+            .unwrap_or(false);
+        if has_query {
+            let _ = self.find_next_match(reverse);
+        } else {
+            self.open_find_prompt();
+        }
+    }
+
+    fn set_search_query(&mut self, query: String) {
+        match self.search.as_mut() {
+            Some(search) if search.query == query => {}
+            Some(search) => {
+                search.query = query;
+                search.last_match = None;
+            }
+            None => {
+                self.search = Some(SearchState::new(query));
+            }
         }
     }
 
@@ -1501,7 +1553,10 @@ impl App {
         match prompt.kind {
             PromptKind::OpenPath => format!("open path: {}_", prompt.input),
             PromptKind::SaveAsPath => format!("save as: {}_", prompt.input),
-            PromptKind::FindQuery => format!("find query: {}_", prompt.input),
+            PromptKind::FindQuery => format!(
+                "find: {}_  |  Enter next  Shift+Enter prev  Esc close",
+                prompt.input
+            ),
             PromptKind::GoToLine => format!("go to line[:col]: {}_", prompt.input),
             PromptKind::OpenRecent => {
                 let preview = self
