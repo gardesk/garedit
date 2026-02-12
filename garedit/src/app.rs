@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub height: u32,
     pub font_family: String,
     pub font_size: f64,
+    pub tab_width: usize,
+    pub show_line_numbers: bool,
     pub file: Option<PathBuf>,
 }
 
@@ -26,6 +28,8 @@ pub struct App {
     document: Document,
     open_path: Option<PathBuf>,
     status_message: Option<String>,
+    tab_width: usize,
+    show_line_numbers: bool,
     viewport_top_line: usize,
     should_quit: bool,
 }
@@ -86,6 +90,8 @@ impl App {
             document,
             open_path,
             status_message,
+            tab_width: config.tab_width.max(1),
+            show_line_numbers: config.show_line_numbers,
             viewport_top_line: 0,
             should_quit: false,
         };
@@ -177,7 +183,7 @@ impl App {
             }
             Key::Tab => self
                 .document
-                .apply(EditCommand::InsertText("    ".to_string())),
+                .apply(EditCommand::InsertText(" ".repeat(self.tab_width))),
             Key::Space => self.document.apply(EditCommand::InsertChar(' ')),
             Key::Char(c) => {
                 if !(key_event.modifiers.ctrl
