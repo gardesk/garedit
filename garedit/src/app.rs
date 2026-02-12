@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
 const GUTTER_WIDTH: i32 = 64;
+const TAB_BAR_HEIGHT: i32 = 30;
+const TAB_WIDTH: i32 = 220;
 const STATUS_BAR_HEIGHT: i32 = 28;
 const MAX_RECENT_FILES: usize = 20;
 
 #[derive(Debug, Clone, Copy)]
 enum PendingAction {
-    OpenPathPrompt,
-    OpenRecentPrompt,
     Quit,
 }
 
@@ -101,6 +101,23 @@ impl SearchState {
 }
 
 #[derive(Debug, Clone)]
+struct OpenTab {
+    document: Document,
+    viewport_top_line: usize,
+    search: Option<SearchState>,
+}
+
+impl OpenTab {
+    fn from_active(document: Document, viewport_top_line: usize, search: Option<SearchState>) -> Self {
+        Self {
+            document,
+            viewport_top_line,
+            search,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub width: u32,
     pub height: u32,
@@ -116,6 +133,8 @@ pub struct App {
     renderer: Renderer,
     gc: u32,
     theme: Theme,
+    tabs: Vec<OpenTab>,
+    active_tab: usize,
     document: Document,
     status_message: Option<String>,
     tab_width: usize,
@@ -182,6 +201,8 @@ impl App {
             renderer,
             gc,
             theme,
+            tabs: vec![OpenTab::from_active(document.clone(), 0, None)],
+            active_tab: 0,
             document,
             status_message,
             tab_width: config.tab_width.max(1),
@@ -219,6 +240,73 @@ impl App {
         })?;
 
         Ok(())
+    }
+
+    fn persist_active_tab(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.document = self.document.clone();
+            tab.viewport_top_line = self.viewport_top_line;
+            tab.search = self.search.clone();
+        }
+    }
+
+    fn activate_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() || index == self.active_tab {
+            return;
+        }
+
+        self.persist_active_tab();
+        self.active_tab = index;
+        if let Some(tab) = self.tabs.get(index) {
+            self.document = tab.document.clone();
+            self.viewport_top_line = tab.viewport_top_line;
+            self.search = tab.search.clone();
+        }
+        self.pointer_drag_anchor = None;
+        self.prompt = None;
+        self.clamp_viewport();
+    }
+
+    fn switch_tab(&mut self, direction: isize) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+
+        let len = self.tabs.len() as isize;
+        let next = (self.active_tab as isize + direction).rem_euclid(len) as usize;
+        self.activate_tab(next);
+        self.status_message = Some(format!("tab {}/{}", self.active_tab + 1, self.tabs.len()));
+    }
+
+    fn new_tab(&mut self) {
+        self.persist_active_tab();
+        self.document = Document::new();
+        self.search = None;
+        self.viewport_top_line = 0;
+        self.pointer_drag_anchor = None;
+        self.prompt = None;
+        self.tabs
+            .push(OpenTab::from_active(self.document.clone(), 0, None));
+        self.active_tab = self.tabs.len() - 1;
+        self.status_message = Some("new tab".to_string());
+    }
+
+    fn tab_title(&self, index: usize) -> String {
+        let (path, dirty) = if index == self.active_tab {
+            (self.document.path().map(Path::to_path_buf), self.document.is_dirty())
+        } else {
+            let tab = &self.tabs[index];
+            (tab.document.path().map(Path::to_path_buf), tab.document.is_dirty())
+        };
+
+        let mut title = path
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "[scratch]".to_string());
+        if dirty {
+            title.push_str(" *");
+        }
+        title
     }
 
     fn handle_event(&mut self, ev: &mut EventLoop, event: InputEvent) {
@@ -337,6 +425,13 @@ impl App {
         }
 
         match key_event.key {
+            Key::Tab => {
+                if key_event.modifiers.shift {
+                    self.switch_tab(-1);
+                } else {
+                    self.switch_tab(1);
+                }
+            }
             Key::Left => self.move_cursor(EditCommand::MoveWordLeft, key_event.modifiers.shift),
             Key::Right => self.move_cursor(EditCommand::MoveWordRight, key_event.modifiers.shift),
             Key::Backspace => self.document.apply(EditCommand::DeleteWordBackward),
@@ -345,6 +440,7 @@ impl App {
                 let lower = c.to_ascii_lowercase();
                 match lower {
                     'q' => self.request_quit(),
+                    't' => self.new_tab(),
                     'o' => self.begin_open_file_flow(),
                     'r' => self.begin_open_recent_flow(),
                     's' => {
@@ -429,12 +525,6 @@ impl App {
                 Key::Return | Key::Char('y') | Key::Char('Y') => {
                     self.prompt = None;
                     match next {
-                        PendingAction::OpenPathPrompt => {
-                            self.prompt = Some(PromptState::open_path())
-                        }
-                        PendingAction::OpenRecentPrompt => {
-                            self.prompt = Some(PromptState::open_recent())
-                        }
                         PendingAction::Quit => self.should_quit = true,
                     }
                 }
@@ -513,18 +603,10 @@ impl App {
     }
 
     fn begin_open_file_flow(&mut self) {
-        if self.document.is_dirty() {
-            self.prompt = Some(PromptState::confirm_discard(PendingAction::OpenPathPrompt));
-            return;
-        }
         self.prompt = Some(PromptState::open_path());
     }
 
     fn begin_open_recent_flow(&mut self) {
-        if self.document.is_dirty() {
-            self.prompt = Some(PromptState::confirm_discard(PendingAction::OpenRecentPrompt));
-            return;
-        }
         self.prompt = Some(PromptState::open_recent());
     }
 
@@ -553,10 +635,24 @@ impl App {
     }
 
     fn open_path(&mut self, path: PathBuf) {
+        let requested = normalize_path_for_match(&path);
+        if let Some(index) = self.find_tab_index_by_path(&requested) {
+            self.activate_tab(index);
+            self.status_message = Some(format!("switched to {}", path.display()));
+            return;
+        }
+
         let existed = path.exists();
         match open_or_create_document(&path) {
             Ok(document) => {
+                self.persist_active_tab();
                 self.document = document;
+                self.tabs.push(OpenTab::from_active(
+                    self.document.clone(),
+                    0,
+                    self.search.clone(),
+                ));
+                self.active_tab = self.tabs.len() - 1;
                 self.viewport_top_line = 0;
                 self.pointer_drag_anchor = None;
                 self.search = None;
@@ -573,6 +669,27 @@ impl App {
                 self.status_message = Some(format!("open failed: {err}"));
             }
         }
+    }
+
+    fn find_tab_index_by_path(&self, target: &Path) -> Option<usize> {
+        if let Some(path) = self.document.path() {
+            if normalize_path_for_match(path) == target {
+                return Some(self.active_tab);
+            }
+        }
+
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            if idx == self.active_tab {
+                continue;
+            }
+            let Some(path) = tab.document.path() else {
+                continue;
+            };
+            if normalize_path_for_match(path) == target {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     fn save_current_document(&mut self) {
@@ -911,6 +1028,14 @@ impl App {
     }
 
     fn handle_mouse_press(&mut self, pointer_x: i32, pointer_y: i32, extend_selection: bool) {
+        if pointer_y < TAB_BAR_HEIGHT {
+            let tab_index = (pointer_x.max(0) / TAB_WIDTH) as usize;
+            if tab_index < self.tabs.len() {
+                self.activate_tab(tab_index);
+            }
+            return;
+        }
+
         let Some(position) = self.cursor_from_pointer(pointer_x, pointer_y) else {
             return;
         };
@@ -1005,7 +1130,7 @@ impl App {
     }
 
     fn content_top(&self) -> i32 {
-        self.theme.padding as i32
+        TAB_BAR_HEIGHT + self.theme.padding as i32
     }
 
     fn status_bar_top(&self) -> i32 {
@@ -1124,6 +1249,63 @@ impl App {
         Ok(())
     }
 
+    fn render_tab_bar(&mut self) -> Result<()> {
+        let size = self.renderer.size();
+        let tab_height = TAB_BAR_HEIGHT as u32;
+
+        self.renderer.fill_rect(
+            Rect::new(0, 0, size.width, tab_height),
+            self.theme.input_background.darken(0.1),
+        )?;
+
+        let style = TextStyle::new()
+            .font_family(&self.theme.font_family)
+            .font_size((self.theme.font_size - 1.0).max(10.0))
+            .color(self.theme.foreground)
+            .ellipsize(true)
+            .max_width((TAB_WIDTH - 16).max(50));
+
+        let mut x = 0i32;
+        for idx in 0..self.tabs.len() {
+            if x >= size.width as i32 {
+                break;
+            }
+            let width = (size.width as i32 - x).min(TAB_WIDTH).max(1) as u32;
+            let active = idx == self.active_tab;
+            let bg = if active {
+                self.theme.item_selected_background
+            } else {
+                self.theme.item_background
+            };
+            self.renderer.fill_rect(Rect::new(x, 0, width, tab_height), bg)?;
+            self.renderer.line(
+                x as f64,
+                0.0,
+                x as f64,
+                TAB_BAR_HEIGHT as f64,
+                self.theme.border.with_alpha(0.7),
+                1.0,
+            )?;
+
+            let title = self.tab_title(idx);
+            self.renderer
+                .text(&title, (x + 8) as f64, 7.0, &style)?;
+
+            x += TAB_WIDTH;
+        }
+
+        self.renderer.line(
+            0.0,
+            TAB_BAR_HEIGHT as f64,
+            size.width as f64,
+            TAB_BAR_HEIGHT as f64,
+            self.theme.border,
+            1.0,
+        )?;
+
+        Ok(())
+    }
+
     fn render(&mut self) -> Result<()> {
         self.clamp_viewport();
         let size = self.renderer.size();
@@ -1144,15 +1326,21 @@ impl App {
             .color(self.theme.item_description);
 
         self.renderer.clear()?;
+        self.render_tab_bar()?;
 
         if gutter_width > 0 {
             self.renderer.fill_rect(
-                Rect::new(0, 0, gutter_width as u32, status_top.max(0) as u32),
+                Rect::new(
+                    0,
+                    TAB_BAR_HEIGHT,
+                    gutter_width as u32,
+                    (status_top - TAB_BAR_HEIGHT).max(0) as u32,
+                ),
                 self.theme.input_background,
             )?;
             self.renderer.line(
                 gutter_width as f64,
-                0.0,
+                TAB_BAR_HEIGHT as f64,
                 gutter_width as f64,
                 status_top as f64,
                 self.theme.border,
@@ -1266,7 +1454,11 @@ impl App {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "[scratch]".to_string());
             let dirty_marker = if self.document.is_dirty() { " [+]" } else { "" };
-            let mut text = format!("{file_display}{dirty_marker}");
+            let mut text = format!(
+                "[tab {}/{}] {file_display}{dirty_marker}",
+                self.active_tab + 1,
+                self.tabs.len()
+            );
             if let Some(message) = &self.status_message {
                 text.push_str("  |  ");
                 text.push_str(message);
@@ -1308,12 +1500,6 @@ impl App {
                     format!("open recent {}  |  pick #: {}_", preview, prompt.input)
                 }
             }
-            PromptKind::ConfirmDiscard {
-                next: PendingAction::OpenPathPrompt,
-            } => "unsaved changes: discard and open file? [y/N]".to_string(),
-            PromptKind::ConfirmDiscard {
-                next: PendingAction::OpenRecentPrompt,
-            } => "unsaved changes: discard and open recent? [y/N]".to_string(),
             PromptKind::ConfirmDiscard {
                 next: PendingAction::Quit,
             } => "unsaved changes: discard and quit? [y/N]".to_string(),
@@ -1404,8 +1590,19 @@ fn resolve_user_path(input: &str) -> PathBuf {
     let trimmed = input.trim();
     if let Some(rest) = trimmed.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
+            return normalize_path_for_match(&home.join(rest));
         }
     }
-    PathBuf::from(trimmed)
+    normalize_path_for_match(&PathBuf::from(trimmed))
+}
+
+fn normalize_path_for_match(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
 }
