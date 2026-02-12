@@ -3,7 +3,7 @@ mod command;
 mod cursor;
 mod selection;
 
-pub use buffer::Document;
+pub use buffer::{Document, NewlineStyle};
 pub use command::EditCommand;
 pub use cursor::Position;
 pub use selection::Selection;
