@@ -1,12 +1,17 @@
 use anyhow::Result;
 use garedit_core::{Document, EditCommand, Position, Selection};
+use garedit_ipc::{Command, Response, ResponseData};
 use gartk_core::{
     InputEvent, Key, KeyEvent, MouseButton, Rect, SelectionNotifyEvent, SelectionRequestEvent,
     Theme,
 };
 use gartk_render::{Renderer, Surface, TextStyle};
 use gartk_x11::{Atoms, Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
+use std::fs;
+use std::io::{self, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt, EventMask, ImageFormat, PropMode,
     SelectionNotifyEvent as XSelectionNotifyEvent,
@@ -266,6 +271,10 @@ pub struct AppConfig {
     pub tab_width: usize,
     pub show_line_numbers: bool,
     pub file: Option<PathBuf>,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub start_hidden: bool,
+    pub disable_ipc: bool,
 }
 
 pub struct App {
@@ -289,6 +298,9 @@ pub struct App {
     local_clipboard: Option<String>,
     paste_property: Atom,
     pending_paste: Option<PendingPaste>,
+    ipc_listener: Option<UnixListener>,
+    ipc_socket_path: Option<PathBuf>,
+    window_visible: bool,
     should_quit: bool,
 }
 
@@ -311,9 +323,16 @@ impl App {
                 .class("garedit")
                 .position(x, y)
                 .size(width, height)
-                .transparent(false),
+                .transparent(false)
+                .map_on_create(!config.start_hidden),
         )?;
-        window.focus()?;
+        if !config.start_hidden {
+            window.activate()?;
+            window.focus()?;
+            conn.flush()?;
+        }
+
+        let (ipc_listener, ipc_socket_path) = Self::setup_ipc_listener(config.disable_ipc)?;
 
         let theme = Theme::builder()
             .font_family(config.font_family)
@@ -364,10 +383,16 @@ impl App {
             local_clipboard: None,
             paste_property,
             pending_paste: None,
+            ipc_listener,
+            ipc_socket_path,
+            window_visible: !config.start_hidden,
             should_quit: false,
         };
         if let Some(path) = app.document.path().map(Path::to_path_buf) {
             app.remember_recent(&path);
+        }
+        if config.line.is_some() || config.column.is_some() {
+            app.jump_to_position(config.line, config.column);
         }
         app.clamp_viewport();
         Ok(app)
@@ -392,6 +417,35 @@ impl App {
         })?;
 
         Ok(())
+    }
+
+    fn setup_ipc_listener(disable_ipc: bool) -> Result<(Option<UnixListener>, Option<PathBuf>)> {
+        if disable_ipc {
+            return Ok((None, None));
+        }
+
+        let socket_path = garedit_ipc::socket_path();
+        if let Some(parent) = socket_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        if socket_path.exists() {
+            match UnixStream::connect(&socket_path) {
+                Ok(_) => {
+                    anyhow::bail!(
+                        "another garedit instance is already listening at {}",
+                        socket_path.display()
+                    );
+                }
+                Err(_) => {
+                    let _ = fs::remove_file(&socket_path);
+                }
+            }
+        }
+
+        let listener = UnixListener::bind(&socket_path)?;
+        listener.set_nonblocking(true)?;
+        Ok((Some(listener), Some(socket_path)))
     }
 
     fn persist_active_tab(&mut self) {
@@ -536,6 +590,11 @@ impl App {
             }
             InputEvent::SelectionClear => {
                 self.pending_paste = None;
+            }
+            InputEvent::Idle => {
+                if self.poll_ipc_commands() {
+                    ev.request_redraw();
+                }
             }
             _ => {}
         }
@@ -1156,8 +1215,180 @@ impl App {
         Ok(())
     }
 
-    fn request_quit(&mut self) {
+    fn poll_ipc_commands(&mut self) -> bool {
+        let mut needs_redraw = false;
+
+        loop {
+            let accept_result = {
+                let Some(listener) = self.ipc_listener.as_ref() else {
+                    break;
+                };
+                listener.accept()
+            };
+
+            match accept_result {
+                Ok((stream, _addr)) => {
+                    if self.handle_ipc_stream(stream) {
+                        needs_redraw = true;
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    self.status_message = Some(format!("ipc accept failed: {err}"));
+                    break;
+                }
+            }
+        }
+
+        needs_redraw
+    }
+
+    fn handle_ipc_stream(&mut self, mut stream: UnixStream) -> bool {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+
+        let mut payload = Vec::new();
+        let (response, needs_redraw) = match stream.read_to_end(&mut payload) {
+            Ok(_) if payload.is_empty() => (Response::err("empty IPC request"), false),
+            Ok(_) => match serde_json::from_slice::<Command>(&payload) {
+                Ok(command) => self.apply_ipc_command(command),
+                Err(err) => (Response::err(format!("invalid IPC payload: {err}")), false),
+            },
+            Err(err) => (
+                Response::err(format!("failed to read IPC payload: {err}")),
+                false,
+            ),
+        };
+
+        if let Ok(serialized) = serde_json::to_vec(&response) {
+            let _ = stream.write_all(&serialized);
+            let _ = stream.flush();
+        }
+
+        needs_redraw
+    }
+
+    fn apply_ipc_command(&mut self, command: Command) -> (Response, bool) {
+        match command {
+            Command::Open { path, line, column } => {
+                let requested = normalize_path_for_match(&path);
+                self.open_path(requested);
+                if let Some(message) = self.status_message.as_ref() {
+                    if message.starts_with("open failed:") {
+                        return (Response::err(message.clone()), true);
+                    }
+                }
+
+                if line.is_some() || column.is_some() {
+                    self.jump_to_position(line, column);
+                }
+
+                if let Err(err) = self.show_window() {
+                    return (Response::err(format!("failed to show window: {err}")), true);
+                }
+                (Response::ok(), true)
+            }
+            Command::Show => match self.show_window() {
+                Ok(()) => (Response::ok(), true),
+                Err(err) => (
+                    Response::err(format!("failed to show window: {err}")),
+                    false,
+                ),
+            },
+            Command::Hide => match self.hide_window() {
+                Ok(()) => (Response::ok(), true),
+                Err(err) => (
+                    Response::err(format!("failed to hide window: {err}")),
+                    false,
+                ),
+            },
+            Command::Toggle => {
+                let result = if self.window_visible {
+                    self.hide_window()
+                } else {
+                    self.show_window()
+                };
+                match result {
+                    Ok(()) => (Response::ok(), true),
+                    Err(err) => (
+                        Response::err(format!("failed to toggle window: {err}")),
+                        false,
+                    ),
+                }
+            }
+            Command::Status => (
+                Response::ok_with_data(ResponseData::Status {
+                    visible: self.window_visible,
+                    open_documents: self.tabs.len(),
+                    focused_document: self.document.path().map(Path::to_path_buf),
+                }),
+                false,
+            ),
+            Command::Quit => {
+                if self.has_unsaved_changes() {
+                    (
+                        Response::err("unsaved changes present; refusing quit request"),
+                        false,
+                    )
+                } else {
+                    self.should_quit = true;
+                    (Response::ok(), true)
+                }
+            }
+        }
+    }
+
+    fn jump_to_position(&mut self, line: Option<usize>, column: Option<usize>) {
+        let line_idx = line
+            .unwrap_or(1)
+            .saturating_sub(1)
+            .min(self.document.line_count().saturating_sub(1));
+        let max_col = self
+            .document
+            .line(line_idx)
+            .map(|text| text.chars().count())
+            .unwrap_or(0);
+        let col_idx = column.unwrap_or(1).saturating_sub(1).min(max_col);
+
+        self.document.clear_selection();
+        self.document.set_cursor(Position::new(line_idx, col_idx));
+        self.ensure_cursor_visible();
+    }
+
+    fn show_window(&mut self) -> Result<()> {
+        if !self.window_visible {
+            self.window.map()?;
+            self.window_visible = true;
+        }
+        self.window.raise()?;
+        self.window.activate()?;
+        self.window.focus()?;
+        self.window.connection().flush()?;
+        Ok(())
+    }
+
+    fn hide_window(&mut self) -> Result<()> {
+        if !self.window_visible {
+            return Ok(());
+        }
+        self.window.unmap()?;
+        self.window.connection().flush()?;
+        self.window_visible = false;
+        Ok(())
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
         if self.document.is_dirty() {
+            return true;
+        }
+        self.tabs
+            .iter()
+            .enumerate()
+            .any(|(idx, tab)| idx != self.active_tab && tab.document.is_dirty())
+    }
+
+    fn request_quit(&mut self) {
+        if self.has_unsaved_changes() {
             self.prompt = Some(PromptState::confirm_discard(PendingAction::Quit));
             return;
         }
@@ -2258,6 +2489,9 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        if let Some(path) = self.ipc_socket_path.as_ref() {
+            let _ = fs::remove_file(path);
+        }
         let _ = self.window.connection().inner().free_gc(self.gc);
     }
 }
