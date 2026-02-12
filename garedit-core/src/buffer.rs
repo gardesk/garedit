@@ -54,6 +54,14 @@ impl History {
         }
     }
 
+    fn push_redo(&mut self, snapshot: Snapshot) {
+        self.redo.push(snapshot);
+        if self.redo.len() > self.limit {
+            let overflow = self.redo.len() - self.limit;
+            self.redo.drain(0..overflow);
+        }
+    }
+
     fn trim_to_limit(&mut self) {
         if self.undo.len() > self.limit {
             let overflow = self.undo.len() - self.limit;
@@ -230,7 +238,7 @@ impl Document {
             return false;
         };
         let current = self.snapshot();
-        self.history.redo.push(current);
+        self.history.push_redo(current);
         self.restore_snapshot(previous);
         true
     }
@@ -549,16 +557,8 @@ impl Document {
             }
 
             line += 1;
-            column = 0;
-            let next_line_len = line_char_count(&self.lines[line]);
-            if next_line_len == 0 {
-                if line + 1 >= self.lines.len() {
-                    return Position::new(line, 0);
-                }
-                continue;
-            }
-            let new_column = next_word_boundary_in_line(&self.lines[line], 0);
-            return Position::new(line, new_column);
+            column = first_non_whitespace_column(&self.lines[line]);
+            return Position::new(line, column);
         }
     }
 
@@ -666,6 +666,12 @@ fn next_word_boundary_in_line(line: &str, column: usize) -> usize {
         i += 1;
     }
     i
+}
+
+fn first_non_whitespace_column(line: &str) -> usize {
+    line.chars()
+        .position(|ch| !ch.is_whitespace())
+        .unwrap_or(0)
 }
 
 fn column_to_byte_idx(line: &str, column: usize) -> usize {
@@ -807,6 +813,33 @@ mod tests {
 
         let _ = fs::remove_file(path);
         Ok(())
+    }
+
+    #[test]
+    fn word_move_across_lines_lands_at_next_line_start() {
+        let mut doc = Document::from_text("foo\nbar baz");
+        doc.set_cursor(Position::new(0, 3));
+        doc.apply(EditCommand::MoveWordRight);
+        assert_eq!(doc.cursor(), Position::new(1, 0));
+        doc.apply(EditCommand::MoveWordRight);
+        assert_eq!(doc.cursor(), Position::new(1, 4));
+    }
+
+    #[test]
+    fn history_limit_is_bounded() {
+        let mut doc = Document::new();
+        doc.set_history_limit(2);
+        doc.apply(EditCommand::InsertText("a".to_string()));
+        doc.apply(EditCommand::InsertText("b".to_string()));
+        doc.apply(EditCommand::InsertText("c".to_string()));
+        assert_eq!(doc.to_text(), "abc");
+
+        doc.apply(EditCommand::Undo);
+        assert_eq!(doc.to_text(), "ab");
+        doc.apply(EditCommand::Undo);
+        assert_eq!(doc.to_text(), "a");
+        doc.apply(EditCommand::Undo);
+        assert_eq!(doc.to_text(), "a");
     }
 
     fn temp_test_path(prefix: &str) -> PathBuf {
