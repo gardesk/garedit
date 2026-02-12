@@ -41,6 +41,7 @@ struct PromptState {
     kind: PromptKind,
     input: String,
     replace_on_type: bool,
+    selection_index: usize,
 }
 
 impl PromptState {
@@ -49,6 +50,7 @@ impl PromptState {
             kind: PromptKind::OpenPath,
             input: String::new(),
             replace_on_type: false,
+            selection_index: 0,
         }
     }
 
@@ -59,6 +61,7 @@ impl PromptState {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             replace_on_type: false,
+            selection_index: 0,
         }
     }
 
@@ -67,6 +70,7 @@ impl PromptState {
             kind: PromptKind::FindQuery,
             input: seed.unwrap_or_default().to_string(),
             replace_on_type,
+            selection_index: 0,
         }
     }
 
@@ -75,6 +79,7 @@ impl PromptState {
             kind: PromptKind::GoToLine,
             input: seed_line.to_string(),
             replace_on_type: false,
+            selection_index: 0,
         }
     }
 
@@ -83,6 +88,7 @@ impl PromptState {
             kind: PromptKind::OpenRecent,
             input: String::new(),
             replace_on_type: false,
+            selection_index: 0,
         }
     }
 
@@ -91,6 +97,7 @@ impl PromptState {
             kind: PromptKind::CommandPalette,
             input: String::new(),
             replace_on_type: false,
+            selection_index: 0,
         }
     }
 
@@ -99,6 +106,7 @@ impl PromptState {
             kind: PromptKind::ConfirmDiscard { next },
             input: String::new(),
             replace_on_type: false,
+            selection_index: 0,
         }
     }
 }
@@ -181,6 +189,26 @@ impl PaletteCommand {
             Self::Cut => "cut selection",
             Self::Paste => "paste clipboard",
             Self::Quit => "quit",
+        }
+    }
+
+    fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenFile => &["o", "open_file", "openfile", "load"],
+            Self::OpenRecent => &["r", "recent_files", "recentfiles"],
+            Self::Save => &["s", "write", "w"],
+            Self::SaveAs => &["saveas", "save_as", "writeas"],
+            Self::NewTab => &["t", "tabnew"],
+            Self::NextTab => &["tabnext", "tn", "next"],
+            Self::PrevTab => &["tabprev", "tp", "prev", "previous"],
+            Self::Find => &["search", "f"],
+            Self::FindNext => &["n", "next_match", "search_next"],
+            Self::FindPrev => &["p", "prev_match", "search_prev"],
+            Self::GoToLine => &["goto", "go", "line", "jump"],
+            Self::Copy => &["yank", "cp"],
+            Self::Cut => &["delete_selection", "x"],
+            Self::Paste => &["insert_clipboard", "v"],
+            Self::Quit => &["q", "exit", "close"],
         }
     }
 }
@@ -693,7 +721,34 @@ impl App {
             return;
         }
 
-        let mut submit: Option<(PromptKind, String, bool)> = None;
+        if matches!(kind, PromptKind::CommandPalette) {
+            let palette_move = match key_event.key {
+                Key::Up => Some(-1isize),
+                Key::Down => Some(1isize),
+                Key::Tab => Some(if key_event.modifiers.shift { -1 } else { 1 }),
+                Key::Char('n')
+                    if key_event.modifiers.ctrl
+                        && !key_event.modifiers.alt
+                        && !key_event.modifiers.super_key =>
+                {
+                    Some(1isize)
+                }
+                Key::Char('p')
+                    if key_event.modifiers.ctrl
+                        && !key_event.modifiers.alt
+                        && !key_event.modifiers.super_key =>
+                {
+                    Some(-1isize)
+                }
+                _ => None,
+            };
+            if let Some(delta) = palette_move {
+                self.move_palette_selection(delta);
+                return;
+            }
+        }
+
+        let mut submit: Option<(PromptKind, String, bool, Option<usize>)> = None;
         let mut cancel = false;
 
         if let Some(prompt) = self.prompt.as_mut() {
@@ -704,6 +759,8 @@ impl App {
                         prompt.kind,
                         prompt.input.trim().to_string(),
                         matches!(prompt.kind, PromptKind::FindQuery) && key_event.modifiers.shift,
+                        matches!(prompt.kind, PromptKind::CommandPalette)
+                            .then_some(prompt.selection_index),
                     ));
                 }
                 Key::Backspace => {
@@ -713,6 +770,9 @@ impl App {
                     } else {
                         prompt.input.pop();
                     }
+                    if matches!(prompt.kind, PromptKind::CommandPalette) {
+                        prompt.selection_index = 0;
+                    }
                 }
                 Key::Space => {
                     if prompt.replace_on_type {
@@ -720,6 +780,9 @@ impl App {
                         prompt.replace_on_type = false;
                     }
                     prompt.input.push(' ');
+                    if matches!(prompt.kind, PromptKind::CommandPalette) {
+                        prompt.selection_index = 0;
+                    }
                 }
                 Key::Char(c) => {
                     if key_event.modifiers.ctrl {
@@ -727,6 +790,9 @@ impl App {
                         if lower == 'u' {
                             prompt.input.clear();
                             prompt.replace_on_type = false;
+                            if matches!(prompt.kind, PromptKind::CommandPalette) {
+                                prompt.selection_index = 0;
+                            }
                         }
                     } else if !(key_event.modifiers.alt || key_event.modifiers.super_key) {
                         if prompt.replace_on_type {
@@ -734,6 +800,9 @@ impl App {
                             prompt.replace_on_type = false;
                         }
                         prompt.input.push(c);
+                        if matches!(prompt.kind, PromptKind::CommandPalette) {
+                            prompt.selection_index = 0;
+                        }
                     }
                 }
                 _ => {}
@@ -746,7 +815,7 @@ impl App {
             return;
         }
 
-        let Some((kind, raw_input, reverse)) = submit else {
+        let Some((kind, raw_input, reverse, selected_index)) = submit else {
             return;
         };
         if !matches!(kind, PromptKind::FindQuery) {
@@ -780,7 +849,7 @@ impl App {
             }
             PromptKind::GoToLine => self.go_to_line_prompt_submit(&raw_input),
             PromptKind::OpenRecent => self.open_recent_prompt_submit(&raw_input),
-            PromptKind::CommandPalette => self.command_palette_submit(&raw_input),
+            PromptKind::CommandPalette => self.command_palette_submit(&raw_input, selected_index),
             PromptKind::ConfirmDiscard { .. } => {}
         }
     }
@@ -1225,23 +1294,96 @@ impl App {
         }
     }
 
-    fn matching_palette_commands(&self, raw_query: &str) -> Vec<PaletteCommand> {
-        let query = raw_query.trim().to_ascii_lowercase();
-        if query.is_empty() {
-            return PALETTE_COMMANDS.to_vec();
-        }
-        let tokens: Vec<&str> = query.split_whitespace().collect();
-        PALETTE_COMMANDS
-            .iter()
-            .copied()
-            .filter(|cmd| {
-                let hay = format!("{} {}", cmd.id(), cmd.label()).to_ascii_lowercase();
-                tokens.iter().all(|token| hay.contains(token))
-            })
-            .collect()
+    fn has_active_selection(&self) -> bool {
+        self.document
+            .selection()
+            .map(|selection| !selection.is_collapsed())
+            .unwrap_or(false)
     }
 
-    fn command_palette_submit(&mut self, raw_input: &str) {
+    fn palette_command_available(&self, command: PaletteCommand) -> bool {
+        match command {
+            PaletteCommand::Copy | PaletteCommand::Cut => self.has_active_selection(),
+            _ => true,
+        }
+    }
+
+    fn palette_token_score(command: PaletteCommand, token: &str) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for candidate in std::iter::once(command.id())
+            .chain(std::iter::once(command.label()))
+            .chain(command.aliases().iter().copied())
+        {
+            let score = if candidate == token {
+                Some(0usize)
+            } else if candidate.starts_with(token) {
+                Some(1usize)
+            } else if candidate.contains(token) {
+                Some(2usize)
+            } else if is_fuzzy_subsequence(candidate, token) {
+                Some(3usize)
+            } else {
+                None
+            };
+            if let Some(score) = score {
+                best = Some(best.map_or(score, |current| current.min(score)));
+            }
+        }
+        best
+    }
+
+    fn palette_match_score(&self, command: PaletteCommand, tokens: &[&str]) -> Option<usize> {
+        if !self.palette_command_available(command) {
+            return None;
+        }
+        if tokens.is_empty() {
+            return Some(0);
+        }
+
+        let mut score = 0usize;
+        for token in tokens {
+            score += Self::palette_token_score(command, token)?;
+        }
+        Some(score)
+    }
+
+    fn matching_palette_commands(&self, raw_query: &str) -> Vec<PaletteCommand> {
+        let query = raw_query.trim().to_ascii_lowercase();
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+
+        let mut scored: Vec<(usize, usize, PaletteCommand)> = PALETTE_COMMANDS
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(order, command)| {
+                self.palette_match_score(command, &tokens)
+                    .map(|score| (score, order, command))
+            })
+            .collect();
+
+        scored.sort_by_key(|(score, order, _)| (*score, *order));
+        scored.into_iter().map(|(_, _, command)| command).collect()
+    }
+
+    fn move_palette_selection(&mut self, delta: isize) {
+        let (input, selection_index) = match self.prompt.as_ref() {
+            Some(prompt) if matches!(prompt.kind, PromptKind::CommandPalette) => {
+                (prompt.input.clone(), prompt.selection_index)
+            }
+            _ => return,
+        };
+        let len = self.matching_palette_commands(&input).len();
+        if len == 0 {
+            return;
+        }
+
+        let next = (selection_index as isize + delta).rem_euclid(len as isize) as usize;
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.selection_index = next;
+        }
+    }
+
+    fn command_palette_submit(&mut self, raw_input: &str, selected_index: Option<usize>) {
         let query = raw_input.trim();
         let matches = self.matching_palette_commands(query);
         if matches.is_empty() {
@@ -1249,7 +1391,9 @@ impl App {
             return;
         }
 
-        let chosen = if let Ok(index) = query.parse::<usize>() {
+        let chosen = if let Some(index) = selected_index {
+            matches[index.min(matches.len() - 1)]
+        } else if let Ok(index) = query.parse::<usize>() {
             if index == 0 || index > matches.len() {
                 self.status_message = Some(format!("command index out of range: {index}"));
                 return;
@@ -1262,7 +1406,11 @@ impl App {
             matches
                 .iter()
                 .copied()
-                .find(|cmd| cmd.id() == lowered || cmd.label() == lowered)
+                .find(|cmd| {
+                    cmd.id() == lowered
+                        || cmd.label() == lowered
+                        || cmd.aliases().iter().any(|alias| *alias == lowered)
+                })
                 .unwrap_or(matches[0])
         };
 
@@ -2037,14 +2185,26 @@ impl App {
                 if commands.is_empty() {
                     format!("command: {}_  |  no matches", prompt.input)
                 } else {
+                    let selected = prompt.selection_index.min(commands.len() - 1);
+                    let mut start = selected.saturating_sub(MAX_PALETTE_PREVIEW / 2);
+                    if start + MAX_PALETTE_PREVIEW > commands.len() {
+                        start = commands.len().saturating_sub(MAX_PALETTE_PREVIEW);
+                    }
                     let preview = commands
                         .iter()
-                        .take(MAX_PALETTE_PREVIEW)
                         .enumerate()
-                        .map(|(idx, cmd)| format!("[{}] {}", idx + 1, cmd.label()))
+                        .skip(start)
+                        .take(MAX_PALETTE_PREVIEW)
+                        .map(|(idx, cmd)| {
+                            let marker = if idx == selected { ">" } else { " " };
+                            format!("{}[{}] {}", marker, idx + 1, cmd.label())
+                        })
                         .collect::<Vec<_>>()
                         .join("  ");
-                    format!("command: {}_  |  {}", prompt.input, preview)
+                    format!(
+                        "command: {}_  |  {}  |  Enter run  Up/Down move  Tab next  Esc close",
+                        prompt.input, preview
+                    )
                 }
             }
             PromptKind::ConfirmDiscard {
@@ -2121,6 +2281,24 @@ fn column_to_byte_idx(line: &str, column: usize) -> usize {
 
 fn byte_to_column_idx(line: &str, byte_idx: usize) -> usize {
     line[..byte_idx.min(line.len())].chars().count()
+}
+
+fn is_fuzzy_subsequence(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+
+    let mut chars = needle.chars();
+    let mut current = chars.next();
+    for candidate in haystack.chars() {
+        let Some(target) = current else {
+            return true;
+        };
+        if candidate == target {
+            current = chars.next();
+        }
+    }
+    current.is_none()
 }
 
 fn open_or_create_document(path: &Path) -> Result<Document> {
