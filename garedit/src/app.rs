@@ -2,8 +2,8 @@ use anyhow::Result;
 use garedit_core::{Document, EditCommand, Position, Selection};
 use garedit_ipc::{Command, Response, ResponseData};
 use gartk_core::{
-    InputEvent, Key, KeyEvent, MouseButton, Rect, SelectionNotifyEvent, SelectionRequestEvent,
-    Theme, ThemeBuilder,
+    Color, InputEvent, Key, KeyEvent, MouseButton, Rect, SelectionNotifyEvent,
+    SelectionRequestEvent, Theme, ThemeBuilder,
 };
 use gartk_render::{Renderer, Surface, TextStyle};
 use gartk_x11::{Atoms, Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
@@ -28,6 +28,64 @@ const MAX_RECENT_FILES: usize = 20;
 const MAX_PALETTE_PREVIEW: usize = 6;
 const SESSION_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(20);
+
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
+    "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
+    "while", "async", "await", "dyn",
+];
+const NIX_KEYWORDS: &[&str] = &[
+    "let", "in", "if", "then", "else", "with", "rec", "inherit", "assert", "or", "true", "false",
+    "null",
+];
+const TOML_KEYWORDS: &[&str] = &["true", "false"];
+const SHELL_KEYWORDS: &[&str] = &[
+    "if", "then", "elif", "else", "fi", "for", "in", "do", "done", "case", "esac", "while",
+    "until", "function", "select",
+];
+const JSON_KEYWORDS: &[&str] = &["true", "false", "null"];
+const YAML_KEYWORDS: &[&str] = &["true", "false", "null", "yes", "no", "on", "off"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyntaxLanguage {
+    Plain,
+    Rust,
+    Nix,
+    Toml,
+    Shell,
+    Json,
+    Yaml,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SyntaxPalette {
+    plain: Color,
+    keyword: Color,
+    string: Color,
+    number: Color,
+    comment: Color,
+    type_name: Color,
+}
+
+impl SyntaxPalette {
+    fn from_theme(theme: &Theme) -> Self {
+        Self {
+            plain: theme.foreground,
+            keyword: theme.input_cursor,
+            string: theme.selection_foreground,
+            number: theme.item_hover_foreground,
+            comment: theme.item_description,
+            type_name: theme.foreground.with_saturation(0.35).lighten(0.12),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SyntaxRun {
+    text: String,
+    color: Color,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum PendingAction {
@@ -2508,6 +2566,8 @@ impl App {
         let cursor = self.document.cursor();
         let gutter_width = self.gutter_width();
         let text_origin_x = self.text_origin_x();
+        let syntax_language = detect_syntax_language(self.document.path());
+        let syntax_palette = SyntaxPalette::from_theme(&self.theme);
 
         let editor_style = self.editor_text_style();
         let line_number_style = TextStyle::new()
@@ -2575,8 +2635,14 @@ impl App {
                     .text(&line_no, line_no_x as f64, y as f64, &line_number_style)?;
             }
 
-            self.renderer
-                .text(&text, text_origin_x as f64, y as f64, &editor_style)?;
+            self.render_line_text(
+                &text,
+                text_origin_x,
+                y,
+                &editor_style,
+                syntax_language,
+                &syntax_palette,
+            )?;
         }
 
         if cursor.line >= self.viewport_top_line
@@ -2757,6 +2823,44 @@ impl App {
         Ok(())
     }
 
+    fn render_line_text(
+        &self,
+        text: &str,
+        x: i32,
+        y: i32,
+        base_style: &TextStyle,
+        language: SyntaxLanguage,
+        palette: &SyntaxPalette,
+    ) -> Result<()> {
+        if text.is_empty() || matches!(language, SyntaxLanguage::Plain) {
+            self.renderer.text(text, x as f64, y as f64, base_style)?;
+            return Ok(());
+        }
+
+        let runs = syntax_runs(text, language, palette);
+        if runs.is_empty() {
+            self.renderer.text(text, x as f64, y as f64, base_style)?;
+            return Ok(());
+        }
+
+        let mut cursor_x = x;
+        for run in runs {
+            if run.text.is_empty() {
+                continue;
+            }
+            let style = base_style.clone().color(run.color);
+            self.renderer
+                .text(&run.text, cursor_x as f64, y as f64, &style)?;
+            let width = self
+                .renderer
+                .measure_text(&run.text, &style)
+                .map(|size| size.width as i32)
+                .unwrap_or(0);
+            cursor_x += width;
+        }
+        Ok(())
+    }
+
     fn editor_text_style(&self) -> TextStyle {
         TextStyle::new()
             .font_family(&self.theme.font_family)
@@ -2785,6 +2889,188 @@ fn resolve_theme(name: &str) -> Theme {
 
 fn is_safe_autosave_name(name: &str) -> bool {
     !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains("..")
+}
+
+fn detect_syntax_language(path: Option<&Path>) -> SyntaxLanguage {
+    let extension = path
+        .and_then(|path| path.extension())
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("rs") => SyntaxLanguage::Rust,
+        Some("nix") => SyntaxLanguage::Nix,
+        Some("toml") => SyntaxLanguage::Toml,
+        Some("sh") | Some("bash") | Some("zsh") => SyntaxLanguage::Shell,
+        Some("json") => SyntaxLanguage::Json,
+        Some("yaml") | Some("yml") => SyntaxLanguage::Yaml,
+        _ => SyntaxLanguage::Plain,
+    }
+}
+
+fn syntax_runs(text: &str, language: SyntaxLanguage, palette: &SyntaxPalette) -> Vec<SyntaxRun> {
+    let (code_part, comment_part) = split_comment(text, language);
+    let mut runs = syntax_runs_without_comment(code_part, language, palette);
+    if let Some(comment) = comment_part {
+        push_syntax_run(&mut runs, comment, palette.comment);
+    }
+    if runs.is_empty() {
+        push_syntax_run(&mut runs, text, palette.plain);
+    }
+    runs
+}
+
+fn syntax_runs_without_comment(
+    text: &str,
+    language: SyntaxLanguage,
+    palette: &SyntaxPalette,
+) -> Vec<SyntaxRun> {
+    let mut runs = Vec::new();
+    let mut index = 0usize;
+
+    while index < text.len() {
+        let mut chars = text[index..].chars();
+        let ch = match chars.next() {
+            Some(ch) => ch,
+            None => break,
+        };
+        let ch_len = ch.len_utf8();
+
+        if ch == '"' || ch == '\'' {
+            let end = find_string_end(text, index, ch);
+            push_syntax_run(&mut runs, &text[index..end], palette.string);
+            index = end;
+            continue;
+        }
+
+        if is_identifier_start(ch) {
+            let mut end = index + ch_len;
+            while end < text.len() {
+                let mut next_chars = text[end..].chars();
+                let Some(next) = next_chars.next() else {
+                    break;
+                };
+                if !is_identifier_continue(next) {
+                    break;
+                }
+                end += next.len_utf8();
+            }
+            let token = &text[index..end];
+            let color = if keyword_set(language).contains(&token) {
+                palette.keyword
+            } else if token
+                .chars()
+                .next()
+                .map(|first| first.is_uppercase())
+                .unwrap_or(false)
+            {
+                palette.type_name
+            } else {
+                palette.plain
+            };
+            push_syntax_run(&mut runs, token, color);
+            index = end;
+            continue;
+        }
+
+        if ch.is_ascii_digit() {
+            let mut end = index + ch_len;
+            while end < text.len() {
+                let mut next_chars = text[end..].chars();
+                let Some(next) = next_chars.next() else {
+                    break;
+                };
+                if !(next.is_ascii_alphanumeric() || next == '_' || next == '.') {
+                    break;
+                }
+                end += next.len_utf8();
+            }
+            push_syntax_run(&mut runs, &text[index..end], palette.number);
+            index = end;
+            continue;
+        }
+
+        push_syntax_run(&mut runs, &text[index..index + ch_len], palette.plain);
+        index += ch_len;
+    }
+
+    runs
+}
+
+fn split_comment<'a>(text: &'a str, language: SyntaxLanguage) -> (&'a str, Option<&'a str>) {
+    let marker = match language {
+        SyntaxLanguage::Rust | SyntaxLanguage::Json => Some("//"),
+        SyntaxLanguage::Nix | SyntaxLanguage::Toml | SyntaxLanguage::Shell => Some("#"),
+        _ => None,
+    };
+    let Some(marker) = marker else {
+        return (text, None);
+    };
+    let Some(index) = text.find(marker) else {
+        return (text, None);
+    };
+    (&text[..index], Some(&text[index..]))
+}
+
+fn find_string_end(text: &str, start: usize, quote: char) -> usize {
+    let mut escaped = false;
+    let mut cursor = start + quote.len_utf8();
+    while cursor < text.len() {
+        let mut chars = text[cursor..].chars();
+        let Some(ch) = chars.next() else {
+            break;
+        };
+        cursor += ch.len_utf8();
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            break;
+        }
+    }
+    cursor
+}
+
+fn keyword_set(language: SyntaxLanguage) -> &'static [&'static str] {
+    match language {
+        SyntaxLanguage::Rust => RUST_KEYWORDS,
+        SyntaxLanguage::Nix => NIX_KEYWORDS,
+        SyntaxLanguage::Toml => TOML_KEYWORDS,
+        SyntaxLanguage::Shell => SHELL_KEYWORDS,
+        SyntaxLanguage::Json => JSON_KEYWORDS,
+        SyntaxLanguage::Yaml => YAML_KEYWORDS,
+        SyntaxLanguage::Plain => &[],
+    }
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric() || ch == '-' || ch == '\''
+}
+
+fn push_syntax_run(runs: &mut Vec<SyntaxRun>, text: &str, color: Color) {
+    if text.is_empty() {
+        return;
+    }
+
+    if let Some(last) = runs.last_mut() {
+        if last.color == color {
+            last.text.push_str(text);
+            return;
+        }
+    }
+
+    runs.push(SyntaxRun {
+        text: text.to_string(),
+        color,
+    });
 }
 
 fn slice_to_column(line: &str, column: usize) -> &str {
