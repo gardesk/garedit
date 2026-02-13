@@ -82,6 +82,7 @@ pub struct Document {
     selection: Option<Selection>,
     dirty: bool,
     revision: u64,
+    goal_column: Option<usize>,
     path: Option<PathBuf>,
     newline_style: NewlineStyle,
     history: History,
@@ -130,6 +131,7 @@ impl Document {
             selection: None,
             dirty: false,
             revision: 0,
+            goal_column: None,
             path,
             newline_style,
             history: History::new(DEFAULT_HISTORY_LIMIT),
@@ -162,6 +164,7 @@ impl Document {
 
     pub fn set_cursor(&mut self, position: Position) {
         self.cursor = self.clamp_position(position);
+        self.goal_column = None;
     }
 
     pub fn selection(&self) -> Option<Selection> {
@@ -254,6 +257,7 @@ impl Document {
         let current = self.snapshot();
         self.history.push_redo(current);
         self.restore_snapshot(previous);
+        self.goal_column = None;
         self.revision = self.revision.wrapping_add(1);
         true
     }
@@ -265,24 +269,61 @@ impl Document {
         let current = self.snapshot();
         self.history.push_undo(current);
         self.restore_snapshot(next);
+        self.goal_column = None;
         self.revision = self.revision.wrapping_add(1);
         true
     }
 
     pub fn apply(&mut self, command: EditCommand) {
         match command {
-            EditCommand::InsertChar(ch) => self.apply_edit(|doc| doc.insert_char(ch)),
-            EditCommand::InsertText(text) => self.apply_edit(|doc| doc.insert_text(&text)),
-            EditCommand::Newline => self.apply_edit(|doc| doc.insert_newline()),
-            EditCommand::Backspace => self.apply_edit(|doc| doc.backspace()),
-            EditCommand::Delete => self.apply_edit(|doc| doc.delete()),
-            EditCommand::DeleteWordBackward => self.apply_edit(|doc| doc.delete_word_backward()),
-            EditCommand::DeleteWordForward => self.apply_edit(|doc| doc.delete_word_forward()),
-            EditCommand::DeleteLine => self.apply_edit(|doc| doc.delete_line()),
-            EditCommand::MoveLeft => self.move_left(),
-            EditCommand::MoveRight => self.move_right(),
-            EditCommand::MoveWordLeft => self.move_word_left(),
-            EditCommand::MoveWordRight => self.move_word_right(),
+            EditCommand::InsertChar(ch) => {
+                self.goal_column = None;
+                self.apply_edit(|doc| doc.insert_char(ch));
+            }
+            EditCommand::InsertText(text) => {
+                self.goal_column = None;
+                self.apply_edit(|doc| doc.insert_text(&text));
+            }
+            EditCommand::Newline => {
+                self.goal_column = None;
+                self.apply_edit(|doc| doc.insert_newline());
+            }
+            EditCommand::Backspace => {
+                self.goal_column = None;
+                self.apply_edit(|doc| doc.backspace());
+            }
+            EditCommand::Delete => {
+                self.goal_column = None;
+                self.apply_edit(|doc| doc.delete());
+            }
+            EditCommand::DeleteWordBackward => {
+                self.goal_column = None;
+                self.apply_edit(|doc| doc.delete_word_backward());
+            }
+            EditCommand::DeleteWordForward => {
+                self.goal_column = None;
+                self.apply_edit(|doc| doc.delete_word_forward());
+            }
+            EditCommand::DeleteLine => {
+                self.goal_column = None;
+                self.apply_edit(|doc| doc.delete_line());
+            }
+            EditCommand::MoveLeft => {
+                self.goal_column = None;
+                self.move_left();
+            }
+            EditCommand::MoveRight => {
+                self.goal_column = None;
+                self.move_right();
+            }
+            EditCommand::MoveWordLeft => {
+                self.goal_column = None;
+                self.move_word_left();
+            }
+            EditCommand::MoveWordRight => {
+                self.goal_column = None;
+                self.move_word_right();
+            }
             EditCommand::MoveUp => self.move_up(),
             EditCommand::MoveDown => self.move_down(),
             EditCommand::MovePageUp(lines) => {
@@ -295,14 +336,20 @@ impl Document {
                     self.move_down();
                 }
             }
-            EditCommand::MoveLineStart => self.cursor.column = 0,
+            EditCommand::MoveLineStart => {
+                self.goal_column = None;
+                self.cursor.column = 0;
+            }
             EditCommand::MoveLineEnd => {
+                self.goal_column = None;
                 self.cursor.column = line_char_count(&self.lines[self.cursor.line]);
             }
             EditCommand::Undo => {
+                self.goal_column = None;
                 self.undo();
             }
             EditCommand::Redo => {
+                self.goal_column = None;
                 self.redo();
             }
         }
@@ -475,18 +522,20 @@ impl Document {
         if self.cursor.line == 0 {
             return;
         }
+        let goal = self.goal_column.get_or_insert(self.cursor.column);
         self.cursor.line -= 1;
         let max_column = line_char_count(&self.lines[self.cursor.line]);
-        self.cursor.column = self.cursor.column.min(max_column);
+        self.cursor.column = (*goal).min(max_column);
     }
 
     fn move_down(&mut self) {
         if self.cursor.line + 1 >= self.lines.len() {
             return;
         }
+        let goal = self.goal_column.get_or_insert(self.cursor.column);
         self.cursor.line += 1;
         let max_column = line_char_count(&self.lines[self.cursor.line]);
-        self.cursor.column = self.cursor.column.min(max_column);
+        self.cursor.column = (*goal).min(max_column);
     }
 
     fn delete_word_backward(&mut self) {
@@ -860,6 +909,38 @@ mod tests {
         assert_eq!(doc.cursor(), Position::new(1, 0));
         doc.apply(EditCommand::MoveWordRight);
         assert_eq!(doc.cursor(), Position::new(1, 4));
+    }
+
+    #[test]
+    fn vertical_moves_preserve_goal_column() {
+        let mut doc = Document::from_text("0123456789abcdef\nabcd\n0123456789abcdef");
+        doc.set_cursor(Position::new(2, 12));
+
+        doc.apply(EditCommand::MoveUp);
+        assert_eq!(doc.cursor(), Position::new(1, 4));
+        doc.apply(EditCommand::MoveUp);
+        assert_eq!(doc.cursor(), Position::new(0, 12));
+
+        doc.apply(EditCommand::MoveDown);
+        assert_eq!(doc.cursor(), Position::new(1, 4));
+        doc.apply(EditCommand::MoveDown);
+        assert_eq!(doc.cursor(), Position::new(2, 12));
+    }
+
+    #[test]
+    fn horizontal_move_resets_goal_column() {
+        let mut doc = Document::from_text("0123456789\nabcd\n0123456789");
+        doc.set_cursor(Position::new(2, 8));
+
+        doc.apply(EditCommand::MoveUp);
+        assert_eq!(doc.cursor(), Position::new(1, 4));
+        doc.apply(EditCommand::MoveLeft);
+        assert_eq!(doc.cursor(), Position::new(1, 3));
+
+        doc.apply(EditCommand::MoveUp);
+        assert_eq!(doc.cursor(), Position::new(0, 3));
+        doc.apply(EditCommand::MoveDown);
+        assert_eq!(doc.cursor(), Position::new(1, 3));
     }
 
     #[test]
