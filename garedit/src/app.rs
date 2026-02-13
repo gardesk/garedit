@@ -13,6 +13,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt, EventMask, ImageFormat, PropMode,
@@ -86,6 +87,12 @@ impl SyntaxPalette {
 struct SyntaxRun {
     text: String,
     color: Color,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSyntaxLine {
+    text: String,
+    runs: Arc<Vec<SyntaxRun>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -431,6 +438,9 @@ pub struct App {
     paste_property: Atom,
     pending_paste: Option<PendingPaste>,
     text_width_cache: HashMap<String, i32>,
+    syntax_cache: HashMap<usize, CachedSyntaxLine>,
+    syntax_cache_revision: u64,
+    syntax_cache_language: SyntaxLanguage,
     ipc_listener: Option<UnixListener>,
     ipc_socket_path: Option<PathBuf>,
     window_visible: bool,
@@ -499,6 +509,8 @@ impl App {
         } else {
             (Document::new(), Some("scratch buffer".to_string()))
         };
+        let initial_syntax_language = detect_syntax_language(document.path());
+        let initial_syntax_revision = document.revision();
 
         let mut app = Self {
             window,
@@ -522,6 +534,9 @@ impl App {
             paste_property,
             pending_paste: None,
             text_width_cache: HashMap::new(),
+            syntax_cache: HashMap::new(),
+            syntax_cache_revision: initial_syntax_revision,
+            syntax_cache_language: initial_syntax_language,
             ipc_listener,
             ipc_socket_path,
             window_visible: !config.start_hidden,
@@ -2720,14 +2735,9 @@ impl App {
                     .text(&line_no, line_no_x as f64, y as f64, &line_number_style)?;
             }
 
-            self.render_line_text(
-                &text,
-                text_origin_x,
-                y,
-                &editor_style,
-                syntax_language,
-                &syntax_palette,
-            )?;
+            let line_runs =
+                self.syntax_runs_for_line(line_index, &text, syntax_language, &syntax_palette);
+            self.render_line_runs(&line_runs, text_origin_x, y, &editor_style)?;
         }
 
         if cursor.line >= self.viewport_top_line
@@ -2908,23 +2918,56 @@ impl App {
         Ok(())
     }
 
-    fn render_line_text(
+    fn syntax_runs_for_line(
         &mut self,
+        line_index: usize,
         text: &str,
+        language: SyntaxLanguage,
+        palette: &SyntaxPalette,
+    ) -> Arc<Vec<SyntaxRun>> {
+        if matches!(language, SyntaxLanguage::Plain) {
+            return Arc::new(vec![SyntaxRun {
+                text: text.to_string(),
+                color: palette.plain,
+            }]);
+        }
+
+        self.refresh_syntax_cache_state(language);
+        if let Some(cached) = self.syntax_cache.get(&line_index) {
+            if cached.text == text {
+                return Arc::clone(&cached.runs);
+            }
+        }
+
+        let runs = Arc::new(syntax_runs(text, language, palette));
+        self.syntax_cache.insert(
+            line_index,
+            CachedSyntaxLine {
+                text: text.to_string(),
+                runs: Arc::clone(&runs),
+            },
+        );
+        runs
+    }
+
+    fn refresh_syntax_cache_state(&mut self, language: SyntaxLanguage) {
+        let revision = self.document.revision();
+        if self.syntax_cache_revision == revision && self.syntax_cache_language == language {
+            return;
+        }
+        self.syntax_cache.clear();
+        self.syntax_cache_revision = revision;
+        self.syntax_cache_language = language;
+    }
+
+    fn render_line_runs(
+        &mut self,
+        runs: &[SyntaxRun],
         x: i32,
         y: i32,
         base_style: &TextStyle,
-        language: SyntaxLanguage,
-        palette: &SyntaxPalette,
     ) -> Result<()> {
-        if text.is_empty() || matches!(language, SyntaxLanguage::Plain) {
-            self.renderer.text(text, x as f64, y as f64, base_style)?;
-            return Ok(());
-        }
-
-        let runs = syntax_runs(text, language, palette);
         if runs.is_empty() {
-            self.renderer.text(text, x as f64, y as f64, base_style)?;
             return Ok(());
         }
 

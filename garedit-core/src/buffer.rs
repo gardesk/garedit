@@ -81,6 +81,7 @@ pub struct Document {
     cursor: Position,
     selection: Option<Selection>,
     dirty: bool,
+    revision: u64,
     path: Option<PathBuf>,
     newline_style: NewlineStyle,
     history: History,
@@ -128,6 +129,7 @@ impl Document {
             cursor: Position::default(),
             selection: None,
             dirty: false,
+            revision: 0,
             path,
             newline_style,
             history: History::new(DEFAULT_HISTORY_LIMIT),
@@ -211,6 +213,10 @@ impl Document {
         self.dirty
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn mark_clean(&mut self) {
         self.dirty = false;
     }
@@ -248,6 +254,7 @@ impl Document {
         let current = self.snapshot();
         self.history.push_redo(current);
         self.restore_snapshot(previous);
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -258,6 +265,7 @@ impl Document {
         let current = self.snapshot();
         self.history.push_undo(current);
         self.restore_snapshot(next);
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -309,6 +317,7 @@ impl Document {
         if !self.same_as_snapshot(&before) {
             self.history.push_undo(before);
             self.history.redo.clear();
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -770,6 +779,19 @@ mod tests {
         assert!(!doc.is_dirty());
         doc.mark_dirty();
         assert!(doc.is_dirty());
+    }
+
+    #[test]
+    fn revision_increments_on_content_change() {
+        let mut doc = Document::new();
+        let revision = doc.revision();
+        doc.apply(EditCommand::InsertChar('a'));
+        assert!(doc.revision() > revision);
+        let changed = doc.revision();
+        doc.apply(EditCommand::MoveLeft);
+        assert_eq!(doc.revision(), changed);
+        doc.apply(EditCommand::Undo);
+        assert!(doc.revision() > changed);
     }
 
     #[test]
