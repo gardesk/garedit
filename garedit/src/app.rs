@@ -206,6 +206,9 @@ enum PaletteCommand {
     OpenRecent,
     Save,
     SaveAs,
+    SaveSession,
+    RestoreSession,
+    ClearSession,
     NewTab,
     NextTab,
     PrevTab,
@@ -226,6 +229,9 @@ impl PaletteCommand {
             Self::OpenRecent => "recent",
             Self::Save => "save",
             Self::SaveAs => "save_as",
+            Self::SaveSession => "save_session",
+            Self::RestoreSession => "restore_session",
+            Self::ClearSession => "clear_session",
             Self::NewTab => "new_tab",
             Self::NextTab => "next_tab",
             Self::PrevTab => "prev_tab",
@@ -246,6 +252,9 @@ impl PaletteCommand {
             Self::OpenRecent => "open recent",
             Self::Save => "save file",
             Self::SaveAs => "save as",
+            Self::SaveSession => "save session",
+            Self::RestoreSession => "restore session",
+            Self::ClearSession => "clear session data",
             Self::NewTab => "new tab",
             Self::NextTab => "next tab",
             Self::PrevTab => "previous tab",
@@ -266,6 +275,9 @@ impl PaletteCommand {
             Self::OpenRecent => &["r", "recent_files", "recentfiles"],
             Self::Save => &["s", "write", "w"],
             Self::SaveAs => &["saveas", "save_as", "writeas"],
+            Self::SaveSession => &["session_save", "snapshot", "autosave_now"],
+            Self::RestoreSession => &["session_restore", "recover", "resume"],
+            Self::ClearSession => &["session_clear", "clear_recovery", "forget_session"],
             Self::NewTab => &["t", "tabnew"],
             Self::NextTab => &["tabnext", "tn", "next"],
             Self::PrevTab => &["tabprev", "tp", "prev", "previous"],
@@ -281,11 +293,14 @@ impl PaletteCommand {
     }
 }
 
-const PALETTE_COMMANDS: [PaletteCommand; 15] = [
+const PALETTE_COMMANDS: [PaletteCommand; 18] = [
     PaletteCommand::OpenFile,
     PaletteCommand::OpenRecent,
     PaletteCommand::Save,
     PaletteCommand::SaveAs,
+    PaletteCommand::SaveSession,
+    PaletteCommand::RestoreSession,
+    PaletteCommand::ClearSession,
     PaletteCommand::NewTab,
     PaletteCommand::NextTab,
     PaletteCommand::PrevTab,
@@ -1457,10 +1472,10 @@ impl App {
         Ok(())
     }
 
-    fn restore_session(&mut self) -> Result<()> {
+    fn restore_session(&mut self) -> Result<usize> {
         let session_file = &self.session_paths.session_file;
         if !session_file.exists() {
-            return Ok(());
+            return Ok(0);
         }
 
         let raw = fs::read_to_string(session_file)?;
@@ -1468,7 +1483,7 @@ impl App {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 tracing::warn!("invalid session snapshot {}: {err}", session_file.display());
-                return Ok(());
+                return Ok(0);
             }
         };
         if snapshot.version != SESSION_SCHEMA_VERSION {
@@ -1477,10 +1492,10 @@ impl App {
                 snapshot.version,
                 SESSION_SCHEMA_VERSION
             );
-            return Ok(());
+            return Ok(0);
         }
         if snapshot.tabs.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let active_tab = snapshot.active_tab;
@@ -1489,7 +1504,7 @@ impl App {
             restored_tabs.push(self.restore_session_tab(tab_snapshot)?);
         }
         if restored_tabs.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         self.tabs = restored_tabs;
@@ -1503,7 +1518,7 @@ impl App {
         self.prompt = None;
         self.clamp_viewport();
         self.status_message = Some(format!("restored {} tab(s)", self.tabs.len()));
-        Ok(())
+        Ok(self.tabs.len())
     }
 
     fn restore_session_tab(&self, tab: SessionTabSnapshot) -> Result<OpenTab> {
@@ -1997,6 +2012,9 @@ impl App {
             PaletteCommand::OpenRecent => self.begin_open_recent_flow(),
             PaletteCommand::Save => self.save_current_document(),
             PaletteCommand::SaveAs => self.begin_save_as_prompt(),
+            PaletteCommand::SaveSession => self.save_session_now(),
+            PaletteCommand::RestoreSession => self.restore_session_now(),
+            PaletteCommand::ClearSession => self.clear_session_state(),
             PaletteCommand::NewTab => self.new_tab(),
             PaletteCommand::NextTab => self.switch_tab(1),
             PaletteCommand::PrevTab => self.switch_tab(-1),
@@ -2010,6 +2028,59 @@ impl App {
             PaletteCommand::Cut => self.cut_selection_to_clipboard(),
             PaletteCommand::Paste => self.request_clipboard_paste(self.clipboard_atoms.clipboard),
             PaletteCommand::Quit => self.request_quit(),
+        }
+    }
+
+    fn save_session_now(&mut self) {
+        match self.persist_session_snapshot() {
+            Ok(()) => self.status_message = Some("session snapshot saved".to_string()),
+            Err(err) => self.status_message = Some(format!("session save failed: {err}")),
+        }
+    }
+
+    fn restore_session_now(&mut self) {
+        if self.has_unsaved_changes() {
+            self.status_message =
+                Some("unsaved changes present; save or discard before restore session".to_string());
+            return;
+        }
+
+        match self.restore_session() {
+            Ok(0) => {
+                self.status_message = Some("no saved session found".to_string());
+            }
+            Ok(restored) => {
+                self.status_message = Some(format!("restored {restored} tab(s)"));
+            }
+            Err(err) => {
+                self.status_message = Some(format!("restore failed: {err}"));
+            }
+        }
+    }
+
+    fn clear_session_state(&mut self) {
+        let mut removed_any = false;
+        if self.session_paths.session_file.exists()
+            && fs::remove_file(&self.session_paths.session_file).is_ok()
+        {
+            removed_any = true;
+        }
+
+        if self.session_paths.autosave_dir.exists()
+            && fs::remove_dir_all(&self.session_paths.autosave_dir).is_ok()
+        {
+            removed_any = true;
+        }
+
+        if let Err(err) = self.session_paths.ensure_dirs() {
+            self.status_message = Some(format!("session cleanup failed: {err}"));
+            return;
+        }
+
+        if removed_any {
+            self.status_message = Some("cleared session + autosave data".to_string());
+        } else {
+            self.status_message = Some("session store already empty".to_string());
         }
     }
 
