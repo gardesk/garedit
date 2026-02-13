@@ -8,7 +8,7 @@ use gartk_core::{
 use gartk_render::{Renderer, Surface, TextStyle};
 use gartk_x11::{Atoms, Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -26,6 +26,7 @@ const TAB_WIDTH: i32 = 220;
 const STATUS_BAR_HEIGHT: i32 = 28;
 const MAX_RECENT_FILES: usize = 20;
 const MAX_PALETTE_PREVIEW: usize = 6;
+const MAX_TEXT_WIDTH_CACHE_ENTRIES: usize = 4096;
 const SESSION_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(20);
 
@@ -414,6 +415,7 @@ pub struct App {
     local_clipboard: Option<String>,
     paste_property: Atom,
     pending_paste: Option<PendingPaste>,
+    text_width_cache: HashMap<String, i32>,
     ipc_listener: Option<UnixListener>,
     ipc_socket_path: Option<PathBuf>,
     window_visible: bool,
@@ -504,6 +506,7 @@ impl App {
             local_clipboard: None,
             paste_property,
             pending_paste: None,
+            text_width_cache: HashMap::new(),
             ipc_listener,
             ipc_socket_path,
             window_visible: !config.start_hidden,
@@ -2328,7 +2331,7 @@ impl App {
         self.ensure_cursor_visible();
     }
 
-    fn cursor_from_pointer(&self, pointer_x: i32, pointer_y: i32) -> Option<Position> {
+    fn cursor_from_pointer(&mut self, pointer_x: i32, pointer_y: i32) -> Option<Position> {
         let content_top = self.content_top();
         let content_bottom = self.content_bottom();
         if pointer_y < content_top || pointer_y >= content_bottom {
@@ -2409,7 +2412,7 @@ impl App {
         self.gutter_width() + self.theme.padding as i32
     }
 
-    fn column_from_x(&self, line: &str, target_x: i32) -> usize {
+    fn column_from_x(&mut self, line: &str, target_x: i32) -> usize {
         if line.is_empty() || target_x <= 0 {
             return 0;
         }
@@ -2420,11 +2423,7 @@ impl App {
 
         for column in 1..=line.chars().count() {
             let prefix = slice_to_column(line, column);
-            let width = self
-                .renderer
-                .measure_text(prefix, &style)
-                .map(|size| size.width as i32)
-                .unwrap_or(prev_width);
+            let width = self.cached_text_width(prefix, &style, prev_width);
 
             if width >= target_x {
                 let dist_prev = (target_x - prev_width).abs();
@@ -2443,12 +2442,27 @@ impl App {
         best_column
     }
 
-    fn text_x_for_column(&self, line: &str, column: usize, style: &TextStyle) -> i32 {
+    fn text_x_for_column(&mut self, line: &str, column: usize, style: &TextStyle) -> i32 {
         let prefix = slice_to_column(line, column);
-        self.renderer
-            .measure_text(prefix, style)
+        self.cached_text_width(prefix, style, 0)
+    }
+
+    fn cached_text_width(&mut self, text: &str, style: &TextStyle, fallback: i32) -> i32 {
+        let cache_key = format!("{:.3}|{}|{}", style.font_size, style.font_family, text);
+        if let Some(width) = self.text_width_cache.get(&cache_key).copied() {
+            return width;
+        }
+
+        let width = self
+            .renderer
+            .measure_text(text, style)
             .map(|size| size.width as i32)
-            .unwrap_or(0)
+            .unwrap_or(fallback);
+        if self.text_width_cache.len() >= MAX_TEXT_WIDTH_CACHE_ENTRIES {
+            self.text_width_cache.clear();
+        }
+        self.text_width_cache.insert(cache_key, width);
+        width
     }
 
     fn render_selection_for_line(
@@ -2824,7 +2838,7 @@ impl App {
     }
 
     fn render_line_text(
-        &self,
+        &mut self,
         text: &str,
         x: i32,
         y: i32,
@@ -2851,11 +2865,7 @@ impl App {
             let style = base_style.clone().color(run.color);
             self.renderer
                 .text(&run.text, cursor_x as f64, y as f64, &style)?;
-            let width = self
-                .renderer
-                .measure_text(&run.text, &style)
-                .map(|size| size.width as i32)
-                .unwrap_or(0);
+            let width = self.cached_text_width(&run.text, &style, 0);
             cursor_x += width;
         }
         Ok(())
