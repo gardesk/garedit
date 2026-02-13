@@ -3,15 +3,17 @@ use garedit_core::{Document, EditCommand, Position, Selection};
 use garedit_ipc::{Command, Response, ResponseData};
 use gartk_core::{
     InputEvent, Key, KeyEvent, MouseButton, Rect, SelectionNotifyEvent, SelectionRequestEvent,
-    Theme,
+    Theme, ThemeBuilder,
 };
 use gartk_render::{Renderer, Surface, TextStyle};
 use gartk_x11::{Atoms, Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt, EventMask, ImageFormat, PropMode,
     SelectionNotifyEvent as XSelectionNotifyEvent,
@@ -24,6 +26,8 @@ const TAB_WIDTH: i32 = 220;
 const STATUS_BAR_HEIGHT: i32 = 28;
 const MAX_RECENT_FILES: usize = 20;
 const MAX_PALETTE_PREVIEW: usize = 6;
+const SESSION_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy)]
 enum PendingAction {
@@ -263,11 +267,63 @@ impl OpenTab {
 }
 
 #[derive(Debug, Clone)]
+struct SessionPaths {
+    session_file: PathBuf,
+    autosave_dir: PathBuf,
+}
+
+impl SessionPaths {
+    fn resolve() -> Self {
+        let base = dirs::state_dir()
+            .or_else(dirs::cache_dir)
+            .unwrap_or_else(std::env::temp_dir);
+        let state_dir = base.join("garedit");
+        Self {
+            session_file: state_dir.join("session.json"),
+            autosave_dir: state_dir.join("autosave"),
+        }
+    }
+
+    fn ensure_dirs(&self) -> Result<()> {
+        if let Some(parent) = self.session_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::create_dir_all(&self.autosave_dir)?;
+        Ok(())
+    }
+
+    fn autosave_path_for_index(&self, index: usize) -> PathBuf {
+        self.autosave_dir.join(format!("tab-{index}.txt"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionSnapshot {
+    version: u32,
+    active_tab: usize,
+    tabs: Vec<SessionTabSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionTabSnapshot {
+    path: Option<PathBuf>,
+    cursor_line: usize,
+    cursor_column: usize,
+    viewport_top_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    autosave_name: Option<String>,
+    dirty: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub width: u32,
     pub height: u32,
     pub font_family: String,
     pub font_size: f64,
+    pub theme_name: String,
     pub tab_width: usize,
     pub show_line_numbers: bool,
     pub file: Option<PathBuf>,
@@ -275,6 +331,8 @@ pub struct AppConfig {
     pub column: Option<usize>,
     pub start_hidden: bool,
     pub disable_ipc: bool,
+    pub restore_session: bool,
+    pub autosave_interval: Duration,
 }
 
 pub struct App {
@@ -301,6 +359,9 @@ pub struct App {
     ipc_listener: Option<UnixListener>,
     ipc_socket_path: Option<PathBuf>,
     window_visible: bool,
+    session_paths: SessionPaths,
+    autosave_interval: Duration,
+    last_session_persist: Instant,
     should_quit: bool,
 }
 
@@ -310,6 +371,8 @@ impl App {
         let clipboard_atoms = Atoms::new(&conn)?;
         let paste_property = conn.intern_atom("GAREDIT_CLIPBOARD", false)?;
         let monitor = gartk_x11::monitor_at_pointer(&conn)?;
+        let session_paths = SessionPaths::resolve();
+        let startup_file = config.file.clone();
 
         let width = config.width.min(monitor.rect.width);
         let height = config.height.min(monitor.rect.height);
@@ -334,7 +397,7 @@ impl App {
 
         let (ipc_listener, ipc_socket_path) = Self::setup_ipc_listener(config.disable_ipc)?;
 
-        let theme = Theme::builder()
+        let theme = ThemeBuilder::from(resolve_theme(&config.theme_name))
             .font_family(config.font_family)
             .font_size(config.font_size)
             .build();
@@ -345,9 +408,9 @@ impl App {
             .create_gc(gc, window.id(), &Default::default())?;
         conn.flush()?;
 
-        let (document, status_message) = if let Some(path) = config.file {
+        let (document, status_message) = if let Some(path) = startup_file.as_ref() {
             let exists = path.exists();
-            match open_or_create_document(&path) {
+            match open_or_create_document(path) {
                 Ok(document) => {
                     let message = if exists {
                         format!("opened {}", path.display())
@@ -386,9 +449,27 @@ impl App {
             ipc_listener,
             ipc_socket_path,
             window_visible: !config.start_hidden,
+            session_paths,
+            autosave_interval: if config.autosave_interval.is_zero() {
+                DEFAULT_AUTOSAVE_INTERVAL
+            } else {
+                config.autosave_interval
+            },
+            last_session_persist: Instant::now(),
             should_quit: false,
         };
-        if let Some(path) = app.document.path().map(Path::to_path_buf) {
+        if startup_file.is_none() && config.restore_session {
+            if let Err(err) = app.restore_session() {
+                tracing::warn!("failed to restore session: {err}");
+            }
+        }
+
+        let recent_files: Vec<PathBuf> = app
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.document.path().map(Path::to_path_buf))
+            .collect();
+        for path in recent_files {
             app.remember_recent(&path);
         }
         if config.line.is_some() || config.column.is_some() {
@@ -415,6 +496,10 @@ impl App {
 
             Ok(!self.should_quit)
         })?;
+
+        if let Err(err) = self.persist_session_snapshot() {
+            tracing::warn!("failed to persist session on shutdown: {err}");
+        }
 
         Ok(())
     }
@@ -592,7 +677,9 @@ impl App {
                 self.pending_paste = None;
             }
             InputEvent::Idle => {
-                if self.poll_ipc_commands() {
+                let ipc_redraw = self.poll_ipc_commands();
+                let autosave_redraw = self.maybe_persist_session();
+                if ipc_redraw || autosave_redraw {
                     ev.request_redraw();
                 }
             }
@@ -1213,6 +1300,197 @@ impl App {
         self.document.apply(EditCommand::InsertText(text));
         self.status_message = Some(format!("pasted {pasted_chars} chars"));
         Ok(())
+    }
+
+    fn maybe_persist_session(&mut self) -> bool {
+        if self.last_session_persist.elapsed() < self.autosave_interval {
+            return false;
+        }
+
+        self.last_session_persist = Instant::now();
+        if let Err(err) = self.persist_session_snapshot() {
+            self.status_message = Some(format!("autosave failed: {err}"));
+            return true;
+        }
+        false
+    }
+
+    fn persist_session_snapshot(&mut self) -> Result<()> {
+        self.persist_active_tab();
+        self.session_paths.ensure_dirs()?;
+
+        let mut keep_autosaves = HashSet::new();
+        let mut tabs = Vec::with_capacity(self.tabs.len());
+
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let document = &tab.document;
+            let dirty = document.is_dirty();
+            let autosave_name = if dirty {
+                let autosave_path = self.session_paths.autosave_path_for_index(index);
+                fs::write(&autosave_path, document.serialized_text())?;
+                let file_name = autosave_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !file_name.is_empty() {
+                    keep_autosaves.insert(file_name.clone());
+                    Some(file_name)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let cursor = document.cursor();
+            tabs.push(SessionTabSnapshot {
+                path: document.path().map(Path::to_path_buf),
+                cursor_line: cursor.line,
+                cursor_column: cursor.column,
+                viewport_top_line: tab.viewport_top_line,
+                search_query: tab
+                    .search
+                    .as_ref()
+                    .map(|search| search.query.trim().to_string())
+                    .filter(|query| !query.is_empty()),
+                autosave_name,
+                dirty,
+            });
+        }
+
+        self.prune_autosave_files(&keep_autosaves)?;
+
+        let snapshot = SessionSnapshot {
+            version: SESSION_SCHEMA_VERSION,
+            active_tab: self.active_tab.min(tabs.len().saturating_sub(1)),
+            tabs,
+        };
+        let payload = serde_json::to_vec_pretty(&snapshot)?;
+        let temp_path = self.session_paths.session_file.with_extension("json.tmp");
+        fs::write(&temp_path, payload)?;
+        fs::rename(&temp_path, &self.session_paths.session_file)?;
+        Ok(())
+    }
+
+    fn prune_autosave_files(&self, keep_autosaves: &HashSet<String>) -> Result<()> {
+        if !self.session_paths.autosave_dir.exists() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(&self.session_paths.autosave_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if keep_autosaves.contains(file_name) {
+                continue;
+            }
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
+    }
+
+    fn restore_session(&mut self) -> Result<()> {
+        let session_file = &self.session_paths.session_file;
+        if !session_file.exists() {
+            return Ok(());
+        }
+
+        let raw = fs::read_to_string(session_file)?;
+        let snapshot: SessionSnapshot = match serde_json::from_str(&raw) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                tracing::warn!("invalid session snapshot {}: {err}", session_file.display());
+                return Ok(());
+            }
+        };
+        if snapshot.version != SESSION_SCHEMA_VERSION {
+            tracing::warn!(
+                "ignoring session snapshot version {} (expected {})",
+                snapshot.version,
+                SESSION_SCHEMA_VERSION
+            );
+            return Ok(());
+        }
+        if snapshot.tabs.is_empty() {
+            return Ok(());
+        }
+
+        let active_tab = snapshot.active_tab;
+        let mut restored_tabs = Vec::with_capacity(snapshot.tabs.len());
+        for tab_snapshot in snapshot.tabs {
+            restored_tabs.push(self.restore_session_tab(tab_snapshot)?);
+        }
+        if restored_tabs.is_empty() {
+            return Ok(());
+        }
+
+        self.tabs = restored_tabs;
+        self.active_tab = active_tab.min(self.tabs.len() - 1);
+        if let Some(active_tab) = self.tabs.get(self.active_tab).cloned() {
+            self.document = active_tab.document;
+            self.viewport_top_line = active_tab.viewport_top_line;
+            self.search = active_tab.search;
+        }
+        self.pointer_drag_anchor = None;
+        self.prompt = None;
+        self.clamp_viewport();
+        self.status_message = Some(format!("restored {} tab(s)", self.tabs.len()));
+        Ok(())
+    }
+
+    fn restore_session_tab(&self, tab: SessionTabSnapshot) -> Result<OpenTab> {
+        let mut document = self.restore_document_from_snapshot(&tab)?;
+        document.set_cursor(Position::new(tab.cursor_line, tab.cursor_column));
+
+        let search = tab
+            .search_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(|query| SearchState::new(query.to_string()));
+        let viewport_top_line = tab
+            .viewport_top_line
+            .min(document.line_count().saturating_sub(1));
+
+        Ok(OpenTab::from_active(document, viewport_top_line, search))
+    }
+
+    fn restore_document_from_snapshot(&self, tab: &SessionTabSnapshot) -> Result<Document> {
+        if tab.dirty {
+            if let Some(autosave_name) = tab.autosave_name.as_deref() {
+                if is_safe_autosave_name(autosave_name) {
+                    let autosave_path = self.session_paths.autosave_dir.join(autosave_name);
+                    if autosave_path.exists() {
+                        let raw = fs::read_to_string(&autosave_path)?;
+                        let mut document = Document::from_text(&raw);
+                        document.set_path(tab.path.clone());
+                        document.mark_dirty();
+                        return Ok(document);
+                    }
+                }
+            }
+        }
+
+        let mut document = match tab.path.as_ref() {
+            Some(path) if path.exists() => Document::open_path(path)?,
+            Some(path) => {
+                let mut document = Document::new();
+                document.set_path(Some(path.clone()));
+                document
+            }
+            None => Document::new(),
+        };
+        if tab.dirty {
+            document.mark_dirty();
+        }
+        Ok(document)
     }
 
     fn poll_ipc_commands(&mut self) -> bool {
@@ -2489,11 +2767,24 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        let _ = self.persist_session_snapshot();
         if let Some(path) = self.ipc_socket_path.as_ref() {
             let _ = fs::remove_file(path);
         }
         let _ = self.window.connection().inner().free_gc(self.gc);
     }
+}
+
+fn resolve_theme(name: &str) -> Theme {
+    match name {
+        "light" => Theme::light(),
+        "high-contrast" => Theme::high_contrast(),
+        _ => Theme::dark(),
+    }
+}
+
+fn is_safe_autosave_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains("..")
 }
 
 fn slice_to_column(line: &str, column: usize) -> &str {

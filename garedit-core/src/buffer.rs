@@ -215,6 +215,10 @@ impl Document {
         self.dirty = false;
     }
 
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     pub fn save(&mut self) -> io::Result<()> {
         let Some(path) = self.path.clone() else {
             return Err(io::Error::new(
@@ -756,6 +760,15 @@ mod tests {
         assert!(!doc.is_dirty());
         doc.apply(EditCommand::Redo);
         assert_eq!(doc.to_text(), "hello");
+        assert!(doc.is_dirty());
+    }
+
+    #[test]
+    fn mark_dirty_sets_dirty_flag() {
+        let mut doc = Document::new();
+        doc.mark_clean();
+        assert!(!doc.is_dirty());
+        doc.mark_dirty();
         assert!(doc.is_dirty());
     }
 

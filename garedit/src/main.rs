@@ -37,6 +37,9 @@ struct Args {
     /// Editor font size
     #[arg(long)]
     font_size: Option<f64>,
+    /// Theme profile: dark, light, or high-contrast
+    #[arg(long)]
+    theme: Option<String>,
     /// Tab width in spaces
     #[arg(long)]
     tab_width: Option<usize>,
@@ -46,6 +49,15 @@ struct Args {
     /// Force line numbers off
     #[arg(long, action = clap::ArgAction::SetTrue)]
     no_line_numbers: bool,
+    /// Force session restore on startup.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    restore_session: bool,
+    /// Disable session restore on startup.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    no_restore_session: bool,
+    /// Autosave/session snapshot interval in seconds.
+    #[arg(long)]
+    autosave_interval_secs: Option<u64>,
     /// Run hidden and listen for IPC requests.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     daemon: bool,
@@ -59,8 +71,11 @@ struct Args {
 struct EditorConfig {
     font_family: String,
     font_size: f64,
+    theme: String,
     tab_width: usize,
     show_line_numbers: bool,
+    restore_session: bool,
+    autosave_interval_secs: u64,
 }
 
 impl Default for EditorConfig {
@@ -68,8 +83,11 @@ impl Default for EditorConfig {
         Self {
             font_family: "monospace".to_string(),
             font_size: 14.0,
+            theme: "dark".to_string(),
             tab_width: 4,
             show_line_numbers: true,
+            restore_session: true,
+            autosave_interval_secs: 20,
         }
     }
 }
@@ -119,6 +137,9 @@ fn main() -> Result<()> {
     if args.line_numbers && args.no_line_numbers {
         anyhow::bail!("cannot pass both --line-numbers and --no-line-numbers");
     }
+    if args.restore_session && args.no_restore_session {
+        anyhow::bail!("cannot pass both --restore-session and --no-restore-session");
+    }
     if args.file.is_none() && (args.line.is_some() || args.column.is_some()) {
         anyhow::bail!("--line/--column require a file argument");
     }
@@ -163,12 +184,24 @@ fn main() -> Result<()> {
     } else {
         config.show_line_numbers
     };
+    let restore_session = if args.restore_session {
+        true
+    } else if args.no_restore_session {
+        false
+    } else {
+        config.restore_session
+    };
+    let theme_name = resolve_theme_name(args.theme.as_deref().unwrap_or(&config.theme))?;
+    let autosave_interval_secs = args
+        .autosave_interval_secs
+        .unwrap_or(config.autosave_interval_secs);
 
     let mut app = App::new(AppConfig {
         width: args.width,
         height: args.height,
         font_family: args.font_family.unwrap_or(config.font_family),
         font_size: args.font_size.unwrap_or(config.font_size),
+        theme_name,
         tab_width: args.tab_width.unwrap_or(config.tab_width).max(1),
         show_line_numbers,
         file: args.file,
@@ -176,8 +209,21 @@ fn main() -> Result<()> {
         column: args.column,
         start_hidden: args.daemon,
         disable_ipc: args.new_instance,
+        restore_session,
+        autosave_interval: std::time::Duration::from_secs(autosave_interval_secs.max(1)),
     })?;
     app.run()
+}
+
+fn resolve_theme_name(raw: &str) -> Result<String> {
+    let lowered = raw.trim().to_ascii_lowercase();
+    let resolved = match lowered.as_str() {
+        "dark" => "dark",
+        "light" => "light",
+        "high-contrast" | "high_contrast" | "highcontrast" => "high-contrast",
+        _ => anyhow::bail!("unknown theme '{raw}'; expected one of: dark, light, high-contrast"),
+    };
+    Ok(resolved.to_string())
 }
 
 fn startup_forward_command(args: &Args) -> Command {
