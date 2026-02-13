@@ -2430,8 +2430,8 @@ impl App {
 
         let text_origin_x = self.text_origin_x();
         let local_x = (pointer_x - text_origin_x).max(0);
-        let line_text = self.document.line(line_index).unwrap_or("");
-        let column = self.column_from_x(line_text, local_x);
+        let line_text = self.document.line(line_index).unwrap_or("").to_string();
+        let column = self.column_from_x(&line_text, local_x);
 
         Some(Position::new(line_index, column))
     }
@@ -2745,8 +2745,8 @@ impl App {
         {
             let cursor_row = cursor.line - self.viewport_top_line;
             let y = content_top + cursor_row as i32 * line_height;
-            let line = self.document.line(cursor.line).unwrap_or("");
-            let prefix_width = self.text_x_for_column(line, cursor.column, &editor_style);
+            let line = self.document.line(cursor.line).unwrap_or("").to_string();
+            let prefix_width = self.text_x_for_column(&line, cursor.column, &editor_style);
             let caret_x = text_origin_x + prefix_width;
 
             self.renderer.fill_rect(
