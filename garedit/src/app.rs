@@ -455,7 +455,7 @@ impl App {
         let conn = Connection::connect(None)?;
         let clipboard_atoms = Atoms::new(&conn)?;
         let paste_property = conn.intern_atom("GAREDIT_CLIPBOARD", false)?;
-        let monitor = gartk_x11::monitor_at_pointer(&conn)?;
+        let monitor = gartk_x11::monitor_of_active_window(&conn)?;
         let session_paths = SessionPaths::resolve();
         let startup_file = config.file.clone();
 
